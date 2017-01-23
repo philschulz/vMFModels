@@ -11,56 +11,6 @@ from utils.gamma_dist import GammaDist
 from utils.logarithms import log_add_list
 from utils.uni_slice_sampler import UnivariateSliceSampler
 
-
-def read_corpus(path_to_source, path_to_target, source_embeddings):
-    '''Read a parallel corpus in text format and output the corpus in numberised format. Also map the source words
-    to embeddings obtained from a word2Vec model.
-
-    :param path_to_source: Path to the source file of the corpus
-    :param path_to_target: Path to the target file of the corpus
-    :param source_embeddings: A gensim Word2Vec model
-    :return: The numberised corpus, a map from target indeces to words, a map from source indeces to (normalised) embeddings
-    and the (normalised) mean of source vectors
-    '''
-    source_map = dict()
-    source2vec = dict()
-    source_mean = 0
-    target_map = {0: "NULL"}
-    corpus = list()
-    s_count = 1
-    t_count = 1
-
-    with open(path_to_source) as source, open(path_to_target) as target:
-        for s_line in source:
-            s_line = s_line.split()
-            t_line = target.readline().split()
-            s_sent = list()
-            t_sent = [0]
-
-            for s_word in s_line:
-                if s_word not in source_map:
-                    source_map[s_word] = s_count
-                    vector = VMFIBM1.normalise_vector(source_embeddings[s_word])
-                    source2vec[s_count] = vector
-                    source_mean += vector
-                    s_sent.append(s_count)
-                    s_count += 1
-                else:
-                    s_sent.append(source_map[s_word])
-
-            for t_word in t_line:
-                if t_word not in target_map:
-                    target_map[t_count] = t_word
-                    t_sent.append(t_count)
-                    t_count += 1
-                else:
-                    t_sent.append(target_map[t_word])
-
-            corpus.append((s_sent, t_sent))
-
-    return corpus, source2vec, target_map, (source_mean / len(source2vec))
-
-
 class VMFIBM1(object):
     '''An alignment model based in IBM model 1 that uses vMF distributions to model source embeddings'''
 
@@ -75,15 +25,15 @@ class VMFIBM1(object):
         '''
         return x / np.linalg.norm(x)
 
-    def __init__(self, dim, source2embeddings, target2words):
+    def __init__(self, dim):
 
         self.dim = dim
         self.dim_half = dim / 2
         self.bessel = lambda x: iv(self.dim_half - 1, x)
         self.bessel_plus_1 = lambda x: iv(self.dim_half, x)
         self.log_two_pi = log(2 * pi) * self.dim_half
-        self.source_embeddings = source2embeddings
-        self.target_vocab = target2words
+        self.source_embeddings = dict()
+        self.target_vocab = dict()
         self.target_params = list()
         self.mu_0 = np.zeros(self.dim)
         self.kappa_0 = 0
@@ -91,6 +41,74 @@ class VMFIBM1(object):
         self.expected_target_means = dict()
         self.expected_target_counts = Counter()
         self.slice_sampler = UnivariateSliceSampler(GammaDist(1, 1))
+
+    def train_model(self, path_to_source, path_to_target, source_embeddings, iterations):
+        print("Starting initial iteration at {}".format(datetime.datetime.now()))
+        corpus = self.read_corpus(path_to_source, path_to_target, source_embeddings)
+        self.train(corpus, iterations-1)
+        self.align(corpus)
+
+    def read_corpus(self, path_to_source, path_to_target, source_embeddings):
+        '''Read a parallel corpus in text format and output the corpus in numberised format. Also map the source words
+        to embeddings obtained from a word2Vec model.
+
+        :param path_to_source: Path to the source file of the corpus
+        :param path_to_target: Path to the target file of the corpus
+        :param source_embeddings: A gensim Word2Vec model
+        :return: The numberised corpus, a map from target indeces to words, a map from source indeces to (normalised) embeddings
+        and the (normalised) mean of source vectors
+        '''
+        source_map = dict()
+        source_mean = 0
+        target_map = {0: "NULL"}
+        corpus = list()
+        s_idx = 1
+        t_idx = 1
+
+        with open(path_to_source) as source, open(path_to_target) as target:
+            for s_line in source:
+                s_line = s_line.split()
+                t_line = target.readline().split()
+                s_sent = list()
+                t_sent = [0]
+
+                for t_word in t_line:
+                    if t_word not in target_map:
+                        target_map[t_idx] = t_word
+                        t_sent.append(t_idx)
+                        t_idx += 1
+                        # initialisation necessary as this is not a counter
+                        self.expected_target_means[t_idx] = 0
+                        self.target_params.append((0,1))
+                    else:
+                        t_sent.append(target_map[t_word])
+
+                for s_word in s_line:
+                    vector = 0
+                    if s_word not in source_map:
+                        source_map[s_word] = s_idx
+                        vector = self.normalise_vector(source_embeddings[s_word])
+                        self.source_embeddings[s_idx] = vector
+                        source_mean += vector
+                        s_sent.append(s_idx)
+                        s_idx += 1
+                    else:
+                        s_idx = source_map[s_word]
+                        s_sent.append(s_idx)
+                        vector = self.source_embeddings[s_idx]
+                        source_mean += vector
+
+                    for idx in t_sent:
+                        self.expected_target_counts[idx] += 1
+                        self.expected_target_means[idx] += vector
+
+
+                corpus.append((s_sent, t_sent))
+
+        for idx, mean in self.expected_target_means:
+            self.target_params[idx] = (self.normalise_vector(mean), 1)
+
+        return corpus
 
     def initialise_params(self):
         # TODO work this over to get a better starting point
@@ -274,18 +292,12 @@ def main():
 
     print("Loading embeddings at {}".format(datetime.datetime.now()))
     embeddings = Word2Vec.load_word2vec_format(args["embeddings"], binary=args["binary"])
-
-    print("Constructing corpus at {}".format(datetime.datetime.now()))
-    corpus, source_map, target_map, source_mean = read_corpus(args["source"], args["target"], embeddings)
     dim = embeddings.vector_size
     iter = args["iter"]
     out_file = args["out_file"]
 
-    aligner = VMFIBM1(dim, source_map, target_map)
-    aligner.initialise_params()
-    aligner.train(corpus, iter)
-
-    aligner.align(corpus, out_file)
+    aligner = VMFIBM1(dim)
+    aligner.train_model(args["source"], args['target'], embeddings)
 
     #print([np.linalg.norm(params[0]) for params in aligner.target_params])
     #print([param[1] for param in aligner.target_params])
