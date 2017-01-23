@@ -46,7 +46,8 @@ class VMFIBM1(object):
         print("Starting initial iteration at {}".format(datetime.datetime.now()))
         corpus = self.read_corpus(path_to_source, path_to_target, source_embeddings)
         self.train(corpus, iterations-1)
-        self.align(corpus)
+        # TODO make out file adjustable
+        self.align(corpus, "alignments.txt")
 
     def read_corpus(self, path_to_source, path_to_target, source_embeddings):
         '''Read a parallel corpus in text format and output the corpus in numberised format. Also map the source words
@@ -60,7 +61,10 @@ class VMFIBM1(object):
         '''
         source_map = dict()
         source_mean = 0
-        target_map = {0: "NULL"}
+        self.target_vocab = {0: "NULL"}
+        self.expected_target_means = {0 : 0}
+        self.target_params.append((0,1))
+        self.target_log_normaliser.append(self.log_normaliser(1))
         corpus = list()
         s_idx = 1
         t_idx = 1
@@ -73,15 +77,16 @@ class VMFIBM1(object):
                 t_sent = [0]
 
                 for t_word in t_line:
-                    if t_word not in target_map:
-                        target_map[t_idx] = t_word
+                    if t_word not in self.target_vocab:
+                        self.target_vocab[t_idx] = t_word
                         t_sent.append(t_idx)
-                        t_idx += 1
                         # initialisation necessary as this is not a counter
                         self.expected_target_means[t_idx] = 0
                         self.target_params.append((0,1))
+                        self.target_log_normaliser.append(self.log_normaliser(1))
+                        t_idx += 1
                     else:
-                        t_sent.append(target_map[t_word])
+                        t_sent.append(self.target_vocab[t_word])
 
                 for s_word in s_line:
                     vector = 0
@@ -105,8 +110,10 @@ class VMFIBM1(object):
 
                 corpus.append((s_sent, t_sent))
 
-        for idx, mean in self.expected_target_means:
+        for idx, mean in self.expected_target_means.items():
             self.target_params[idx] = (self.normalise_vector(mean), 1)
+
+        self.update_params()
 
         return corpus
 
@@ -302,7 +309,7 @@ def main():
     out_file = args["out_file"]
 
     aligner = VMFIBM1(dim)
-    aligner.train_model(args["source"], args['target'], embeddings)
+    aligner.train_model(args["source"], args['target'], embeddings, iter)
 
     #print([np.linalg.norm(params[0]) for params in aligner.target_params])
     #print([param[1] for param in aligner.target_params])
