@@ -124,8 +124,9 @@ class VMFIBM1(object):
                             best_score = score
                             best_idx = t_idx
 
+                    # TODO this is Moses style alignment. Also allow for NAACL format
                     if best_idx > 0:
-                        links.append(str(s_idx) + '-' + str(best_idx))
+                        links.append(str(s_idx) + '-' + str(best_idx - 1))
 
                 out.write(" ".join(links) + "\n")
 
@@ -190,6 +191,10 @@ class VMFIBM1(object):
             sum_of_means += new_mean
             self.target_params[idx] = (new_mean, new_kappa)
             self.target_log_normaliser[idx] = new_log_norm
+
+            # reset expectations
+            self.expected_target_means[idx] = 0
+            self.expected_target_counts[idx] = 0
 
         return sum_of_means
 
