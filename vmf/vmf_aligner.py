@@ -1,4 +1,5 @@
 import argparse, sys
+sys.path.append("..")
 import datetime
 from collections import Counter
 from math import log, exp, pi
