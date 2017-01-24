@@ -1,5 +1,5 @@
 import argparse, sys
-sys.path.append("..")
+sys.path.append("../utils")
 import datetime
 from collections import Counter
 from math import log, exp, pi
