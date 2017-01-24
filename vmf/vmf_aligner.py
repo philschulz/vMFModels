@@ -25,7 +25,7 @@ def read_corpus(path_to_source, path_to_target, source_embeddings):
     source_map = dict()
     source2vec = dict()
     source_mean = 0
-    target_map = {0: "NULL"}
+    target_map = {"NULL" : 0}
     corpus = list()
     s_count = 1
     t_count = 1
@@ -50,13 +50,15 @@ def read_corpus(path_to_source, path_to_target, source_embeddings):
 
             for t_word in t_line:
                 if t_word not in target_map:
-                    target_map[t_count] = t_word
+                    target_map[t_word] = t_count
                     t_sent.append(t_count)
                     t_count += 1
                 else:
                     t_sent.append(target_map[t_word])
 
             corpus.append((s_sent, t_sent))
+
+    print(corpus)
 
     return corpus, source2vec, target_map, (source_mean / len(source2vec))
 
@@ -97,7 +99,7 @@ class VMFIBM1(object):
         self.mu_0 = np.zeros(self.dim)
         self.kappa_0 = 1
         log_norm = self.log_normaliser(1)
-        for target in sorted(self.target_vocab.keys()):
+        for target in sorted(self.target_vocab.values()):
             # TODO initialise with source mean later on
             self.target_params.append((np.zeros(self.dim), 1))
             self.target_log_normaliser.append(log_norm)
@@ -191,6 +193,9 @@ class VMFIBM1(object):
             self.target_params[idx] = (new_mean, new_kappa)
             self.target_log_normaliser[idx] = new_log_norm
 
+            self.expected_target_counts[idx] = 0
+            self.expected_target_means[idx] = 0
+
         return sum_of_means
 
     def update_global_params(self, sum_of_means):
@@ -247,6 +252,14 @@ class VMFIBM1(object):
         exponent = kappa * np.dot(mu, ss)
         return log_normaliser + exponent
 
+    def write_param(self, path_to_file):
+        with open(path_to_file + ".means", "w") as means, open(path_to_file + ".concentration", "w") as conc:
+            means.write(str(len(self.target_params)) + " " + str(self.dim) + "\n")
+            # no embedding needed for NULL word
+            for word, idx in self.target_vocab.items():
+                params = self.target_params[idx]
+                means.write(word + " " + ' '.join(map(str, params[0])) + "\n")
+                conc.write(word + ' ' + str(params[1]) + "\n")
 
 def main():
     command_line_parser = argparse.ArgumentParser("This is word alignment tool that uses word vectors on the source"
@@ -286,6 +299,7 @@ def main():
     aligner.train(corpus, iter)
 
     aligner.align(corpus, out_file)
+    #aligner.write_param("test")
 
     #print([np.linalg.norm(params[0]) for params in aligner.target_params])
     #print([param[1] for param in aligner.target_params])
