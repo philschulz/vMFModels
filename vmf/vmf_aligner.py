@@ -1,5 +1,6 @@
-import argparse, sys
-sys.path.append("../utils")
+import argparse, sys, os
+# necessary for processing on cluster
+sys.path.append(os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
 import datetime
 from collections import Counter
 from math import log, exp, pi
@@ -277,7 +278,7 @@ def main():
     command_line_parser.add_argument('--embeddings', '-e', type=str, required=True,
                                      help="Path to the file which stores the source "
                                           "embeddings.")
-    command_line_parser.add_argument('--binary', '-b', type=bool, default=False,
+    command_line_parser.add_argument('--binary', '-b', action="store_true",
                                      help="Indicates whether the embeddings file is in word2vec "
                                           "binary or text format.")
     command_line_parser.add_argument('--iter', '-i', type=int, default=10, help="Set the number of iterations used for "
