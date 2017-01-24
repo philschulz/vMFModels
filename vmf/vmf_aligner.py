@@ -7,7 +7,7 @@ from math import log, exp, pi
 
 import numpy as np
 from gensim.models import Word2Vec
-from scipy.special import iv
+from scipy.special import iv, psi
 
 from utils.gamma_dist import GammaDist
 from utils.logarithms import log_add_list
@@ -59,8 +59,6 @@ def read_corpus(path_to_source, path_to_target, source_embeddings):
                     t_sent.append(target_map[t_word])
 
             corpus.append((s_sent, t_sent))
-
-    print(corpus)
 
     return corpus, source2vec, target_map, (source_mean / len(source2vec))
 
@@ -263,10 +261,98 @@ class VMFIBM1(object):
                 means.write(word + " " + ' '.join(map(str, params[0])) + "\n")
                 conc.write(word + ' ' + str(params[1]) + "\n")
 
+class VMFIBM1Mult(VMFIBM1):
+
+    def __init__(self, dim, source_embeddings, target2words, dirichlet_param):
+        super().__init__(dim, source_embeddings, target2words)
+        self.translation_categoricals = list()
+        self.expected_translation_counts = list()
+        self.dirichlet_param = dirichlet_param
+
+    def initialise_params(self):
+        # TODO work this over to get a better starting point
+        self.mu_0 = np.zeros(self.dim)
+        self.kappa_0 = 1
+        log_norm = self.log_normaliser(1)
+        for _ in sorted(self.target_vocab.values()):
+            # TODO initialise with source mean later on
+            self.target_params.append((np.zeros(self.dim), 1))
+            self.target_log_normaliser.append(log_norm)
+            self.translation_categoricals.append(dict())
+            self.expected_translation_counts.append(dict())
+
+    def compute_expectations(self, source_sent, target_sent):
+        '''Compute the expectations for one sentence pair under the current variational parameters
+
+        :param source_sent: The numberised source sentence
+        :param target_sent: The numberised target sentence
+        '''
+        for source in source_sent:
+            embedding = self.source_embeddings[source]
+            log_scores = list()
+            for target in target_sent:
+                cat_score = self.translation_categoricals[target][source] if source in self.translation_categoricals[target] else 0
+                log_scores.append(cat_score)
+
+            total = log_add_list(log_scores)
+            idx = 0
+            for target in target_sent:
+                posterior = exp(log_scores[idx] - total)
+                try:
+                    self.expected_target_means[target] += embedding * posterior
+                except KeyError:
+                    self.expected_target_means[target] = embedding * posterior
+                self.expected_target_counts[target] += posterior
+
+                #categorical expectations
+                try:
+                    self.translation_categoricals[target][source] += posterior
+                except KeyError:
+                    self.translation_categoricals[target][source] = posterior
+
+    def update_target_params(self):
+        '''Update the variational parameters and auxiliary quantities of the vMFs distributions associated with
+         the target types.
+
+         :return: The sum of the newly estimated expected mean parameters
+         '''
+
+        sum_of_means = 0
+        prior_ss = self.kappa_0 * self.mu_0
+
+        for idx, params in enumerate(self.target_params):
+            mu_e, kappa_e = params
+            ss = self.expected_target_means[idx]
+            posterior_ss = kappa_e * ss + prior_ss
+            normal_ss = self.normalise_vector(posterior_ss)
+
+            # print("mu_e = {}, kappa_e = {}, count = {}, ss = {}".format(mu_e,kappa_e,self.expected_target_counts[idx],ss))
+            new_kappa, new_log_norm, avg_bessel = self.sample_concentration(mu_e, kappa_e,
+                                                                            self.expected_target_counts[idx],
+                                                                            ss)
+            new_mean = avg_bessel * normal_ss
+            sum_of_means += new_mean
+            self.target_params[idx] = (new_mean, new_kappa)
+            self.target_log_normaliser[idx] = new_log_norm
+
+            # update categorical params
+            new_params = dict()
+            for s_idx, count in self.translation_categoricals[idx].items():
+                new_params[s_idx] = psi(count) - psi(self.expected_target_counts[idx])
+            self.translation_categoricals[idx] = new_params
+
+            self.expected_translation_counts[idx] = dict()
+            self.expected_target_counts[idx] = 0
+            self.expected_target_means[idx] = 0
+
+        return sum_of_means
+
 
 def main():
     command_line_parser = argparse.ArgumentParser("This is word alignment tool that uses word vectors on the source"
                                                   "side.")
+    command_line_parser.add_argument('--model', '-m', type=str, default="vmf", help="Specify the model to be used during"
+                                                                                    "alignment.")
     command_line_parser.add_argument('--source', '-s', type=str, required=True,
                                      help="Path to the source side of the corpus. "
                                           "The source side should be given as text, "
@@ -287,6 +373,7 @@ def main():
                                                                                                   "which the output alignments shall be printed")
 
     args = vars(command_line_parser.parse_args())
+    model = args["model"]
 
     print("Loading embeddings at {}".format(datetime.datetime.now()))
     embeddings = Word2Vec.load_word2vec_format(args["embeddings"], binary=args["binary"])
@@ -297,12 +384,13 @@ def main():
     iter = args["iter"]
     out_file = args["out_file"]
 
-    aligner = VMFIBM1(dim, source_map, target_map)
+    aligner = VMFIBM1(dim, source_map, target_map) if model == "vmf" else VMFIBM1Mult(dim, source_map, target_map, 0.001)
     aligner.initialise_params()
     aligner.train(corpus, iter)
 
+    print("Starting to aling at {}".format(datetime.datetime.now()))
     aligner.align(corpus, out_file)
-    aligner.write_param("source")
+    aligner.write_param("target")
 
 
 if __name__ == "__main__":
