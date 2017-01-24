@@ -25,7 +25,7 @@ def read_corpus(path_to_source, path_to_target, source_embeddings):
     source_map = dict()
     source2vec = dict()
     source_mean = 0
-    target_map = {"NULL" : 0}
+    target_map = {"NULL": 0}
     corpus = list()
     s_count = 1
     t_count = 1
@@ -113,7 +113,7 @@ class VMFIBM1(object):
 
         with open(out_file, 'w') as out:
             for s_sent, t_sent in corpus:
-                #print('source = {}, target = {}'.format(s_sent, t_sent))
+                # print('source = {}, target = {}'.format(s_sent, t_sent))
 
                 links = list()
                 for s_idx, s_word in enumerate(s_sent):
@@ -121,7 +121,7 @@ class VMFIBM1(object):
                     best_score = float('-inf')
                     for t_idx, t_word in enumerate(t_sent):
                         score = self.log_density(s_word, t_word)
-                        #print('s = {},t = {}, score = {}'.format(s_idx, t_idx, score))
+                        # print('s = {},t = {}, score = {}'.format(s_idx, t_idx, score))
                         if score > best_score:
                             best_score = score
                             best_idx = t_idx
@@ -261,6 +261,7 @@ class VMFIBM1(object):
                 means.write(word + " " + ' '.join(map(str, params[0])) + "\n")
                 conc.write(word + ' ' + str(params[1]) + "\n")
 
+
 def main():
     command_line_parser = argparse.ArgumentParser("This is word alignment tool that uses word vectors on the source"
                                                   "side.")
@@ -299,10 +300,8 @@ def main():
     aligner.train(corpus, iter)
 
     aligner.align(corpus, out_file)
-    #aligner.write_param("test")
+    aligner.write_param("source")
 
-    #print([np.linalg.norm(params[0]) for params in aligner.target_params])
-    #print([param[1] for param in aligner.target_params])
 
 if __name__ == "__main__":
     main()
