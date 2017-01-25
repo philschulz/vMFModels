@@ -58,7 +58,7 @@ class UnivariateSliceSampler(object):
             for _ in range(left_steps):
                 left_edge -= self.step_size
                 if left_edge <= 0:
-                    left_edge = 0
+                    left_edge = 0.00001
                     break
                 elif self.likelihood(left_edge) + self.prior_dist.log_density(left_edge) < threshold:
                     break

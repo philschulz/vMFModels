@@ -1,11 +1,13 @@
-import argparse, sys
+import argparse, sys, os
+# necessary for processing on cluster
+sys.path.append(os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
 import datetime
 from collections import Counter
 from math import log, exp, pi
 
 import numpy as np
 from gensim.models import Word2Vec
-from scipy.special import iv
+from scipy.special import iv, psi
 
 from utils.gamma_dist import GammaDist
 from utils.logarithms import log_add_list
@@ -25,7 +27,7 @@ def read_corpus(path_to_source, path_to_target, source_embeddings):
     source_map = dict()
     source2vec = dict()
     source_mean = 0
-    target_map = {0: "NULL"}
+    target_map = {"NULL": 0}
     corpus = list()
     s_count = 1
     t_count = 1
@@ -50,7 +52,7 @@ def read_corpus(path_to_source, path_to_target, source_embeddings):
 
             for t_word in t_line:
                 if t_word not in target_map:
-                    target_map[t_count] = t_word
+                    target_map[t_word] = t_count
                     t_sent.append(t_count)
                     t_count += 1
                 else:
@@ -97,7 +99,7 @@ class VMFIBM1(object):
         self.mu_0 = np.zeros(self.dim)
         self.kappa_0 = 1
         log_norm = self.log_normaliser(1)
-        for target in sorted(self.target_vocab.keys()):
+        for target in sorted(self.target_vocab.values()):
             # TODO initialise with source mean later on
             self.target_params.append((np.zeros(self.dim), 1))
             self.target_log_normaliser.append(log_norm)
@@ -111,7 +113,7 @@ class VMFIBM1(object):
 
         with open(out_file, 'w') as out:
             for s_sent, t_sent in corpus:
-                #print('source = {}, target = {}'.format(s_sent, t_sent))
+                # print('source = {}, target = {}'.format(s_sent, t_sent))
 
                 links = list()
                 for s_idx, s_word in enumerate(s_sent):
@@ -119,14 +121,13 @@ class VMFIBM1(object):
                     best_score = float('-inf')
                     for t_idx, t_word in enumerate(t_sent):
                         score = self.log_density(s_word, t_word)
-                        #print('s = {},t = {}, score = {}'.format(s_idx, t_idx, score))
+                        # print('s = {},t = {}, score = {}'.format(s_idx, t_idx, score))
                         if score > best_score:
                             best_score = score
                             best_idx = t_idx
 
-                    # TODO this is Moses style alignment. Also allow for NAACL format
                     if best_idx > 0:
-                        links.append(str(s_idx) + '-' + str(best_idx - 1))
+                        links.append(str(s_idx) + '-' + str(best_idx))
 
                 out.write(" ".join(links) + "\n")
 
@@ -192,9 +193,8 @@ class VMFIBM1(object):
             self.target_params[idx] = (new_mean, new_kappa)
             self.target_log_normaliser[idx] = new_log_norm
 
-            # reset expectations
-            self.expected_target_means[idx] = 0
             self.expected_target_counts[idx] = 0
+            self.expected_target_means[idx] = 0
 
         return sum_of_means
 
@@ -252,10 +252,107 @@ class VMFIBM1(object):
         exponent = kappa * np.dot(mu, ss)
         return log_normaliser + exponent
 
+    def write_param(self, path_to_file):
+        with open(path_to_file + ".means", "w") as means, open(path_to_file + ".concentration", "w") as conc:
+            means.write(str(len(self.target_params)) + " " + str(self.dim) + "\n")
+            # no embedding needed for NULL word
+            for word, idx in self.target_vocab.items():
+                params = self.target_params[idx]
+                means.write(word + " " + ' '.join(map(str, params[0])) + "\n")
+                conc.write(word + ' ' + str(params[1]) + "\n")
+
+class VMFIBM1Mult(VMFIBM1):
+
+    def __init__(self, dim, source_embeddings, target2words, dirichlet_param):
+        super().__init__(dim, source_embeddings, target2words)
+        self.translation_categoricals = list()
+        self.expected_translation_counts = list()
+        self.dirichlet_param = dirichlet_param
+
+    def initialise_params(self):
+        # TODO work this over to get a better starting point
+        self.mu_0 = np.zeros(self.dim)
+        self.kappa_0 = 1
+        log_norm = self.log_normaliser(1)
+        for _ in sorted(self.target_vocab.values()):
+            # TODO initialise with source mean later on
+            self.target_params.append((np.zeros(self.dim), 1))
+            self.target_log_normaliser.append(log_norm)
+            self.translation_categoricals.append(dict())
+            self.expected_translation_counts.append(dict())
+
+    def compute_expectations(self, source_sent, target_sent):
+        '''Compute the expectations for one sentence pair under the current variational parameters
+
+        :param source_sent: The numberised source sentence
+        :param target_sent: The numberised target sentence
+        '''
+        for source in source_sent:
+            embedding = self.source_embeddings[source]
+            log_scores = list()
+            for target in target_sent:
+                cat_score = self.translation_categoricals[target][source] if source in self.translation_categoricals[target] else 0
+                log_scores.append(cat_score)
+
+            total = log_add_list(log_scores)
+            idx = 0
+            for target in target_sent:
+                posterior = exp(log_scores[idx] - total)
+                try:
+                    self.expected_target_means[target] += embedding * posterior
+                except KeyError:
+                    self.expected_target_means[target] = embedding * posterior
+                self.expected_target_counts[target] += posterior
+
+                #categorical expectations
+                try:
+                    self.translation_categoricals[target][source] += posterior
+                except KeyError:
+                    self.translation_categoricals[target][source] = posterior
+
+    def update_target_params(self):
+        '''Update the variational parameters and auxiliary quantities of the vMFs distributions associated with
+         the target types.
+
+         :return: The sum of the newly estimated expected mean parameters
+         '''
+
+        sum_of_means = 0
+        prior_ss = self.kappa_0 * self.mu_0
+
+        for idx, params in enumerate(self.target_params):
+            mu_e, kappa_e = params
+            ss = self.expected_target_means[idx]
+            posterior_ss = kappa_e * ss + prior_ss
+            normal_ss = self.normalise_vector(posterior_ss)
+
+            # print("mu_e = {}, kappa_e = {}, count = {}, ss = {}".format(mu_e,kappa_e,self.expected_target_counts[idx],ss))
+            new_kappa, new_log_norm, avg_bessel = self.sample_concentration(mu_e, kappa_e,
+                                                                            self.expected_target_counts[idx],
+                                                                            ss)
+            new_mean = avg_bessel * normal_ss
+            sum_of_means += new_mean
+            self.target_params[idx] = (new_mean, new_kappa)
+            self.target_log_normaliser[idx] = new_log_norm
+
+            # update categorical params
+            new_params = dict()
+            for s_idx, count in self.translation_categoricals[idx].items():
+                new_params[s_idx] = psi(count) - psi(self.expected_target_counts[idx])
+            self.translation_categoricals[idx] = new_params
+
+            self.expected_translation_counts[idx] = dict()
+            self.expected_target_counts[idx] = 0
+            self.expected_target_means[idx] = 0
+
+        return sum_of_means
+
 
 def main():
     command_line_parser = argparse.ArgumentParser("This is word alignment tool that uses word vectors on the source"
                                                   "side.")
+    command_line_parser.add_argument('--model', '-m', type=str, default="vmf", help="Specify the model to be used during"
+                                                                                    "alignment.")
     command_line_parser.add_argument('--source', '-s', type=str, required=True,
                                      help="Path to the source side of the corpus. "
                                           "The source side should be given as text, "
@@ -267,7 +364,7 @@ def main():
     command_line_parser.add_argument('--embeddings', '-e', type=str, required=True,
                                      help="Path to the file which stores the source "
                                           "embeddings.")
-    command_line_parser.add_argument('--binary', '-b', type=bool, default=False,
+    command_line_parser.add_argument('--binary', '-b', action="store_true",
                                      help="Indicates whether the embeddings file is in word2vec "
                                           "binary or text format.")
     command_line_parser.add_argument('--iter', '-i', type=int, default=10, help="Set the number of iterations used for "
@@ -276,6 +373,7 @@ def main():
                                                                                                   "which the output alignments shall be printed")
 
     args = vars(command_line_parser.parse_args())
+    model = args["model"]
 
     print("Loading embeddings at {}".format(datetime.datetime.now()))
     embeddings = Word2Vec.load_word2vec_format(args["embeddings"], binary=args["binary"])
@@ -286,14 +384,14 @@ def main():
     iter = args["iter"]
     out_file = args["out_file"]
 
-    aligner = VMFIBM1(dim, source_map, target_map)
+    aligner = VMFIBM1(dim, source_map, target_map) if model == "vmf" else VMFIBM1Mult(dim, source_map, target_map, 0.001)
     aligner.initialise_params()
     aligner.train(corpus, iter)
 
+    print("Starting to aling at {}".format(datetime.datetime.now()))
     aligner.align(corpus, out_file)
+    aligner.write_param("target")
 
-    #print([np.linalg.norm(params[0]) for params in aligner.target_params])
-    #print([param[1] for param in aligner.target_params])
 
 if __name__ == "__main__":
     main()
