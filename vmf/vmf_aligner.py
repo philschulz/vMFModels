@@ -461,7 +461,7 @@ def main():
     aligner = VMFIBM1(dim, source_map, target_map) if model == "vmf" else VMFIBM1Mult(dim, source_map, target_map,
                                                                                       dir)
     aligner.sample_concentration_params(sample)
-
+    aligner.initialise_params()
     aligner.train(corpus, iter)
 
     print("Starting to align at {}".format(datetime.datetime.now()))
