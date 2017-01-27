@@ -279,6 +279,7 @@ class VMFIBM1(object):
             print('Kappa = {}, log(kappa) = {}, bessel = {}, log-bessel = {}'.format(kappa, log(kappa),
                                                                                      self.bessel(kappa),
                                                                                      log(self.bessel(kappa))))
+            sys.exit(0)
 
     def vmf_likelihood(self, mu, kappa, num_observations, ss):
         '''Compute the log-likelihood of a vMF.
@@ -459,6 +460,9 @@ def main():
 
     aligner = VMFIBM1(dim, source_map, target_map) if model == "vmf" else VMFIBM1Mult(dim, source_map, target_map,
                                                                                       dir)
+    aligner.sample_concentration_params(sample)
+
+    aligner.train(corpus, iter)
 
     print("Starting to align at {}".format(datetime.datetime.now()))
     aligner.align(corpus, out_file)
