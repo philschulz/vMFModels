@@ -1,4 +1,4 @@
-import argparse, sys, os, math
+import argparse, sys, os
 
 # necessary for processing on cluster
 sys.path.append(os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
@@ -264,6 +264,7 @@ class VMFIBM1(object):
         '''
         mu, kappa = self.target_params[target]
         embedding = self.source_embeddings[source]
+        # TODO precompute log-normalisers through sampling
         return self.target_log_normaliser[target] + np.dot(embedding, mu) * kappa
 
     def log_normaliser(self, kappa):
@@ -272,7 +273,12 @@ class VMFIBM1(object):
         :param kappa: The concentration of the vMF
         :return: The value of the log-normaliser
         '''
-        return log(kappa) * (self.dim_half - 1) - log(self.bessel(kappa)) - self.log_two_pi
+        try:
+            return log(kappa) * (self.dim_half - 1) - log(self.bessel(kappa)) - self.log_two_pi
+        except:
+            print('Kappa = {}, log(kappa) = {}, bessel = {}, log-bessel = {}'.format(kappa, log(kappa),
+                                                                                     self.bessel(kappa),
+                                                                                     log(self.bessel(kappa))))
 
     def vmf_likelihood(self, mu, kappa, num_observations, ss):
         '''Compute the log-likelihood of a vMF.
@@ -299,6 +305,7 @@ class VMFIBM1(object):
 
 
 class VMFIBM1Mult(VMFIBM1):
+
     def __init__(self, dim, source_embeddings, target2words, dirichlet_param):
         super().__init__(dim, source_embeddings, target2words)
         self.translation_categoricals = list()
@@ -336,6 +343,9 @@ class VMFIBM1Mult(VMFIBM1):
             log_scores = list()
             for target in target_sent:
                 log_scores.append(self.log_density(source, target))
+                cat_score = self.translation_categoricals[target][source] if source in self.translation_categoricals[
+                    target] else 0
+                log_scores.append(cat_score)
 
             total = log_add_list(log_scores)
             idx = 0
@@ -449,10 +459,6 @@ def main():
 
     aligner = VMFIBM1(dim, source_map, target_map) if model == "vmf" else VMFIBM1Mult(dim, source_map, target_map,
                                                                                       dir)
-    aligner.sample_concentration_params(sample)
-
-    aligner.initialise_params()
-    aligner.train(corpus, iter)
 
     print("Starting to align at {}".format(datetime.datetime.now()))
     aligner.align(corpus, out_file)
