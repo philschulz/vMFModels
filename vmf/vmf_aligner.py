@@ -229,7 +229,8 @@ class VMFIBM1(object):
         :return: The triple (updated concentration, updated log-normaliser, updated bessel ratio)
         '''
         r = np.linalg.norm(ss) / num_observations
-        kappa = (r * self.dim - r ** 3) / (1 - r ** 2)
+        # make sure that kappa is never 0 for numerical stability
+        kappa = ((r * self.dim - r ** 3) / (1 - r ** 2)) + 1e-10
         return kappa, self.log_normaliser(kappa), self.bessel_ratio(kappa)
 
     def sample_concentration(self, mu, kappa, num_observations, ss):
