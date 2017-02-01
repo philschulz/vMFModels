@@ -9,6 +9,7 @@ from collections import Counter
 import numpy as np
 from gensim.models import Word2Vec
 from scipy.special import iv, psi
+from scipy.misc import logsumexp
 
 from utils.gamma_dist import GammaDist
 from utils.uni_slice_sampler import UnivariateSliceSampler
@@ -68,8 +69,7 @@ def read_corpus(path_to_source, path_to_target, source_embeddings):
 class VMFIBM1(object):
     '''An alignment model based in IBM model 1 that uses vMF distributions to model source embeddings'''
 
-    slice_iterations = 10
-    concentration_cap = 100
+    slice_iterations = 5
 
     @staticmethod
     def normalise_vector(x):
@@ -80,7 +80,7 @@ class VMFIBM1(object):
         '''
         return x / np.linalg.norm(x, axis=1).reshape(x.shape[0], 1) if len(x.shape) > 1 else x / np.linalg.norm(x)
 
-    def __init__(self, dim, source2embeddings, target2words):
+    def __init__(self, dim, source2embeddings, target2words, concentration_cap = None, concentration_fix = None):
 
         self.dim = dim
         self.dim_half = dim / 2
@@ -90,10 +90,11 @@ class VMFIBM1(object):
         self.source_embeddings = source2embeddings
         self.target_vocab = target2words
         # row-matrices
-        self.target_means = np.zeros((len(self.target_vocab), self.dim))
+        self.target_variational_means = np.zeros((len(self.target_vocab), self.dim))
+        self.expected_target_means = np.zeros((len(self.target_vocab), self.dim))
         self.expected_target_means = np.zeros((len(self.target_vocab), self.dim))
         # vectors
-        self.target_concentrations = np.ones(len(self.target_vocab)) * self.concentration_cap
+        self.target_concentrations = np.ones(len(self.target_vocab)) * concentration_fix if concentration_fix else np.ones(len(self.target_vocab))
         self.target_log_normaliser = self.log_normaliser(self.target_concentrations)
         self.expected_target_counts = np.zeros(len(self.target_vocab))
 
@@ -102,6 +103,8 @@ class VMFIBM1(object):
         self.slice_sampler = UnivariateSliceSampler(GammaDist(10, 1))
         self.sample = False
         self.init = False
+        self.concentration_cap = concentration_cap
+        self.fix_concentration = concentration_fix != None
 
     def sample_concentration_params(self, sample=True):
         self.sample = sample
@@ -146,11 +149,10 @@ class VMFIBM1(object):
         :param target_sent: The numberised target sentence
         '''
         source_vecs = self.source_embeddings[source_sent]
-        scores = np.exp(self.log_density(source_sent, target_sent)) if self.init else np.ones(
-            (len(source_sent), len(target_sent)))
+        scores = self.log_density(source_sent, target_sent) if self.init else np.zeros((len(source_sent), len(target_sent)))
         # sum rows
-        totals = np.sum(scores, axis=1).reshape(len(source_sent), 1)
-        posteriors = scores / totals
+        totals = logsumexp(scores, axis=1).reshape(len(source_sent), 1)
+        posteriors = np.exp(scores - totals)
 
         self.expected_target_counts[target_sent] += np.sum(posteriors, axis=0)
         self.expected_target_means[target_sent] += np.dot(posteriors.T, source_vecs)
@@ -168,25 +170,23 @@ class VMFIBM1(object):
 
         posterior_ss = self.target_concentrations.reshape(
             (self.target_concentrations.size, 1)) * self.expected_target_means + prior_ss
-        normal_ss = self.normalise_vector(posterior_ss)
+        self.target_means = self.normalise_vector(posterior_ss)
 
         if self.sample:
-            kappa, log_normaliser, bessel_ratio = self.sample_concentration(self.target_means,
+            kappa, log_normaliser, bessel_ratio = self.sample_concentration(self.target_variational_means,
                                                                             self.target_concentrations,
                                                                             self.expected_target_counts,
                                                                             self.expected_target_means)
             self.target_concentrations = kappa
             self.target_log_normaliser = log_normaliser
-            self.target_means = normal_ss * bessel_ratio.reshape((self.target_concentrations.size, 1))
+            self.target_variational_means = self.target_means * bessel_ratio.reshape((self.target_concentrations.size, 1))
         else:
-            # self.target_concentrations = self.update_concentration(self.expected_target_counts,
-            #                                                       self.expected_target_means)
-            # print("conc max _= {}".format(np.max(self.target_concentrations)))
-            # print("con min = {}".format(np.min(self.target_concentrations)))
-            self.target_means = normal_ss * self.bessel_ratio(self.target_concentrations).reshape(
-                (self.target_concentrations.size, 1))
-            # self.target_log_normaliser = self.log_normaliser(self.target_concentrations)
-
+            new_concentration, bessel_ratio = self.update_concentration(self.expected_target_counts,
+                                                                  self.expected_target_means)
+            if not self.fix_concentration:
+                self.target_concentrations = new_concentration
+                self.target_log_normaliser = self.log_normaliser(self.target_concentrations)
+            self.target_variational_means = self.target_means * bessel_ratio.reshape(self.target_concentrations.size, 1)
         # reset expectations
         self.expected_target_counts = np.zeros(len(self.target_vocab))
         self.expected_target_means = np.zeros((len(self.target_vocab), self.dim))
@@ -195,9 +195,9 @@ class VMFIBM1(object):
         '''Update the global parameters through empirical Bayes (MLE on expected params)'''
 
         # sum rows
-        sum_of_means = np.sum(self.target_means, axis=0)
+        sum_of_means = np.sum(self.target_variational_means, axis=0)
         self.mu_0 = self.normalise_vector(sum_of_means)
-        self.kappa_0 = self.update_concentration(len(self.target_means), sum_of_means.reshape((1, self.dim)))
+        self.kappa_0, _ = self.update_concentration(len(self.target_variational_means), sum_of_means.reshape((1, self.dim)))
 
     def update_concentration(self, num_observations, ss):
         '''Update the concentration parameter of a vMF using empirical Bayes.
@@ -206,11 +206,12 @@ class VMFIBM1(object):
         :param ss: The (expected) sufficient statistics for this distribution
         :return: The updated concentration parameter
         '''
-        r = np.linalg.norm(ss, axis=1) / num_observations + 1e-10
+        # TODO this is just a smoothing hack to make sure r != 1
+        r = np.linalg.norm(ss, axis=1) / (num_observations + 1)
         # make sure that kappa is never 0 for numerical stability
 
         # TODO Fix this! kappa is somethimes negative which should be impossible
-        kappa = ((r * self.dim - np.power(r, 3)) / (1 - np.power(r, 2))) + 1e-10
+        kappa = ((r * self.dim) / (1 - np.power(r, 2))) + 1e-10
         # if np.any(kappa <= 0):
         #     print(self.expected_target_means.shape)
         #     sorted_kappa = np.sort(kappa)
@@ -220,8 +221,21 @@ class VMFIBM1(object):
         #     print(len(self.target_vocab))
         #     print(kappa.shape)
         #     print("Fuck")
-        kappa[kappa > self.concentration_cap] = self.concentration_cap
-        return kappa
+        #     print(np.linalg.norm(ss[kappa < 0]))
+        #     print(r[kappa < 0])
+        #     print(num_observations[kappa < 0])
+        #     meh = r[kappa < 0]
+        #     idx = np.where(kappa < 0)
+        #     print((meh*self.dim - np.power(meh,3))/(1-np.power(meh, 2)))
+        #     print(idx[0][0])
+        #     for key, value in self.target_vocab.items():
+        #         if value == idx[0][0]:
+        #             print(key)
+        #             print(self.target_concentrations[value])
+        #             break
+        if self.concentration_cap:
+            kappa[kappa > self.concentration_cap] = self.concentration_cap
+        return kappa, r
 
     def sample_concentration(self, mu, kappa, num_observations, ss):
         '''Sample a concentration value and functions of it using slice sampling
@@ -258,7 +272,7 @@ class VMFIBM1(object):
         :return: The density of the embedding given the target word
         '''
         source_vecs = self.source_embeddings[source_sent]
-        target_means = self.target_means[target_sent]
+        target_means = self.target_variational_means[target_sent]
         target_concentrations = self.target_concentrations[target_sent]
         log_normalisers = self.target_log_normaliser[target_sent]
 
@@ -304,7 +318,7 @@ class VMFIBM1(object):
             means.write(str(len(self.target_means)) + " " + str(self.dim) + "\n")
             # no embedding needed for NULL word
             for word, idx in self.target_vocab.items():
-                mean = self.target_means[idx]
+                mean = self.target_variational_means[idx]
                 kappa = self.target_concentrations[idx]
                 means.write(word + " " + ' '.join(map(str, mean)) + "\n")
                 conc.write(word + ' ' + str(kappa) + "\n")
@@ -332,8 +346,8 @@ class VMFIBM1Mult(VMFIBM1):
             pmf = self.translation_categoricals[target]
             for sdx, source in enumerate(source_sent):
                 cat_score[sdx, tdx] = pmf[source]
-        vmv_score = super().log_density(source_sent, target_sent)
-        return cat_score + vmv_score
+        vmf_score = super().log_density(source_sent, target_sent)
+        return cat_score + vmf_score
 
     def compute_expectations(self, source_sent, target_sent):
         '''Compute the expectations for one sentence pair under the current variational parameters
@@ -342,11 +356,11 @@ class VMFIBM1Mult(VMFIBM1):
         :param target_sent: The numberised target sentence
         '''
         source_vecs = self.source_embeddings[source_sent]
-        scores = np.exp(self.log_density(source_sent, target_sent)) if self.init else np.ones(
+        scores = self.log_density(source_sent, target_sent) if self.init else np.zeros(
             (len(source_sent), len(target_sent)))
         # sum rows
-        totals = np.sum(scores, axis=1).reshape(len(source_sent), 1)
-        posteriors = scores / totals
+        totals = logsumexp(scores, axis=1).reshape(len(source_sent), 1)
+        posteriors = np.exp(scores - totals)
 
         self.expected_target_counts[target_sent] += np.sum(posteriors, axis=0)
         self.expected_target_means[target_sent] += np.dot(posteriors.T, source_vecs)
@@ -362,15 +376,15 @@ class VMFIBM1Mult(VMFIBM1):
 
          :return: The sum of the newly estimated expected mean parameters
          '''
-
         prior_ss = self.kappa_0 * self.mu_0
 
         posterior_ss = self.target_concentrations.reshape(
             (self.target_concentrations.size, 1)) * self.expected_target_means + prior_ss
-        normal_ss = self.normalise_vector(posterior_ss)
-        self.target_concentrations = self.update_concentration(self.expected_target_counts, self.expected_target_means)
-        self.target_means = normal_ss * self.bessel_ratio(self.target_concentrations).reshape(
-            (self.target_concentrations.size, 1))
+        self.target_means = self.normalise_vector(posterior_ss)
+
+        self.target_concentrations, bessel_ratio = self.update_concentration(self.expected_target_counts,
+                                                                             self.expected_target_means)
+        self.target_variational_means = self.target_means * bessel_ratio.reshape(self.target_concentrations.size, 1)
         self.target_log_normaliser = self.log_normaliser(self.target_concentrations)
         for target, count in enumerate(self.expected_target_counts):
             total = psi(count + self.dirichlet_total)
@@ -416,8 +430,9 @@ def main():
     command_line_parser.add_argument("--dirichlet-param", '-d', type=float, default=0.001,
                                      help="Set the parameter of the Dirichlet prior for the "
                                           "combined categorical and vMF model.")
-    command_line_parser.add_argument("--target-concentration", type=float, default=10,
+    command_line_parser.add_argument("--fix-target-concentration", type=float,
                                      help="Set fixed concentration parameter for all target words.")
+    command_line_parser.add_argument("--concentration-cap", type=float, help="Caps the possible concentration values at a maximum.")
 
     args = vars(command_line_parser.parse_args())
     model = args["model"]
@@ -425,6 +440,8 @@ def main():
     out_file = args["out_file"]
     sample = args["sample_concentration"]
     dir = args["dirichlet_param"]
+    fix = args["fix_target_concentration"]
+    cap = args["concentration_cap"]
 
     print("Loading embeddings at {}".format(datetime.datetime.now()))
     embeddings = Word2Vec.load_word2vec_format(args["embeddings"], binary=args["binary"])
