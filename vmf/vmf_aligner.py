@@ -1,5 +1,6 @@
-import argparse, sys, os
+import argparse, sys, os, warnings
 
+# warnings.filterwarnings("error")
 # necessary for processing on cluster
 sys.path.append(os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
 import datetime
@@ -67,7 +68,7 @@ def read_corpus(path_to_source, path_to_target, source_embeddings):
 class VMFIBM1(object):
     '''An alignment model based in IBM model 1 that uses vMF distributions to model source embeddings'''
 
-    slice_iterations = 50
+    slice_iterations = 10
     concentration_cap = 100
 
     @staticmethod
@@ -92,7 +93,7 @@ class VMFIBM1(object):
         self.target_means = np.zeros((len(self.target_vocab), self.dim))
         self.expected_target_means = np.zeros((len(self.target_vocab), self.dim))
         # vectors
-        self.target_concentrations = np.ones(len(self.target_vocab))
+        self.target_concentrations = np.ones(len(self.target_vocab)) * self.concentration_cap
         self.target_log_normaliser = self.log_normaliser(self.target_concentrations)
         self.expected_target_counts = np.zeros(len(self.target_vocab))
 
@@ -178,11 +179,13 @@ class VMFIBM1(object):
             self.target_log_normaliser = log_normaliser
             self.target_means = normal_ss * bessel_ratio.reshape((self.target_concentrations.size, 1))
         else:
-            self.target_concentrations = self.update_concentration(self.expected_target_counts,
-                                                                   self.expected_target_means)
+            # self.target_concentrations = self.update_concentration(self.expected_target_counts,
+            #                                                       self.expected_target_means)
+            # print("conc max _= {}".format(np.max(self.target_concentrations)))
+            # print("con min = {}".format(np.min(self.target_concentrations)))
             self.target_means = normal_ss * self.bessel_ratio(self.target_concentrations).reshape(
                 (self.target_concentrations.size, 1))
-            self.target_log_normaliser = self.log_normaliser(self.target_concentrations)
+            # self.target_log_normaliser = self.log_normaliser(self.target_concentrations)
 
         # reset expectations
         self.expected_target_counts = np.zeros(len(self.target_vocab))
@@ -203,13 +206,22 @@ class VMFIBM1(object):
         :param ss: The (expected) sufficient statistics for this distribution
         :return: The updated concentration parameter
         '''
-        r = np.linalg.norm(ss, axis=1) / num_observations
+        r = np.linalg.norm(ss, axis=1) / num_observations + 1e-10
         # make sure that kappa is never 0 for numerical stability
+
+        # TODO Fix this! kappa is somethimes negative which should be impossible
         kappa = ((r * self.dim - np.power(r, 3)) / (1 - np.power(r, 2))) + 1e-10
-        # cap concentration at 100
-        kappa[kappa > 100] = self.concentration_cap
-        # avoid 0 values
-        return kappa + 1e-10
+        # if np.any(kappa <= 0):
+        #     print(self.expected_target_means.shape)
+        #     sorted_kappa = np.sort(kappa)
+        #     suspicious_observations = num_observations[kappa < 0]
+        #     suspicious_norms = np.linalg.norm(ss, axis=1)[kappa < 0]
+        #     suspicious_means = ss[kappa < 0]
+        #     print(len(self.target_vocab))
+        #     print(kappa.shape)
+        #     print("Fuck")
+        kappa[kappa > self.concentration_cap] = self.concentration_cap
+        return kappa
 
     def sample_concentration(self, mu, kappa, num_observations, ss):
         '''Sample a concentration value and functions of it using slice sampling
@@ -229,7 +241,9 @@ class VMFIBM1(object):
         log_normaliser_avg = sum(log_normaliser_samples) / len(log_normaliser_samples)
         bessel_ratio_avg = sum(bessel_ratio_samples) / len(bessel_ratio_samples)
 
-        return np.repeat(average, len(self.target_vocab)), np.repeat(log_normaliser_avg, len(self.target_vocab)), np.repeat(bessel_ratio_avg, len(self.target_vocab))
+        return np.repeat(average, len(self.target_vocab)), np.repeat(log_normaliser_avg,
+                                                                     len(self.target_vocab)), np.repeat(
+            bessel_ratio_avg, len(self.target_vocab))
 
     def bessel_ratio(self, kappa):
         result = self.bessel_plus_1(kappa) / self.bessel(kappa)
@@ -393,8 +407,8 @@ def main():
                                           "binary or text format.")
     command_line_parser.add_argument('--iter', '-i', type=int, default=10, help="Set the number of iterations used for "
                                                                                 "training.")
-    command_line_parser.add_argument('--out-file', '-o', type=str, default="alignments.txt", help="Path to the file to"
-                                                                                                  "which the output alignments shall be printed")
+    command_line_parser.add_argument('--out-file', '-o', type=str, default="alignments", help="Path to the file to"
+                                                                                              "which the output alignments shall be printed")
     command_line_parser.add_argument('--sample-concentration', '-c', action='store_true',
                                      help="Compute the expected concentration parameters under a Gamma "
                                           "prior. Warning: this will take a lot of time, especially if the "
@@ -402,6 +416,8 @@ def main():
     command_line_parser.add_argument("--dirichlet-param", '-d', type=float, default=0.001,
                                      help="Set the parameter of the Dirichlet prior for the "
                                           "combined categorical and vMF model.")
+    command_line_parser.add_argument("--target-concentration", type=float, default=10,
+                                     help="Set fixed concentration parameter for all target words.")
 
     args = vars(command_line_parser.parse_args())
     model = args["model"]
