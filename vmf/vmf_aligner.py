@@ -235,6 +235,9 @@ class VMFIBM1(object):
         #             break
         if self.concentration_cap:
             kappa[kappa > self.concentration_cap] = self.concentration_cap
+        # TODO only needed for debugging -> remove
+        elif np.any(kappa < 0):
+            print(kappa[kappa < 0])
         return kappa, r
 
     def sample_concentration(self, mu, kappa, num_observations, ss):
@@ -450,7 +453,7 @@ def main():
     corpus, source_map, target_map, source_mean = read_corpus(args["source"], args["target"], embeddings)
     dim = embeddings.vector_size
 
-    aligner = VMFIBM1(dim, source_map, target_map) if model == "vmf" else VMFIBM1Mult(dim, source_map, target_map,
+    aligner = VMFIBM1(dim, source_map, target_map, cap, fix) if model == "vmf" else VMFIBM1Mult(dim, source_map, target_map,
                                                                                       dir)
     aligner.sample_concentration_params(sample)
     aligner.initialise_params()
