@@ -43,7 +43,7 @@ def diagonal_gaussian_kl(mean: np.array, std: np.array) -> float:
 
 def diagonal_gaussian_kl_grad(mean: np.array, std: np.array) -> Tuple[float, float]:
     mean_grad = -np.sum(mean, axis=1)
-    std_grad = np.sum(std/(std**2) - std)
+    std_grad = np.sum(std/(std**2) - std, axis=1)
     return mean_grad, std_grad
 
 

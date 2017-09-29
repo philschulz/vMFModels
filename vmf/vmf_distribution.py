@@ -17,11 +17,15 @@ class VMF(object):
         '''
         normaliser = (np.log(kappa) * (self.dim / 2 - 1) - np.log(self.bessel(kappa)))
         energy = np.dot(mu, data.T)
-        density = normaliser * energy * kappa
+        density = normaliser + energy * kappa
         kappa_grad = (self.dim / 2 - 1) / kappa - self.__log_bessel_gradient(kappa)
-        kappa_grad += energy
+        kappa_grad = data.shape[0] * kappa_grad + np.sum(energy, axis=1)[:,np.newaxis]
+
+        # if np.any(np.isnan(density)):
+        #     print(density)
+        #     print("kappa = {}".format(kappa))
 
         return density, kappa_grad
 
     def __log_bessel_gradient(self, kappa: float) -> float:
-        return (bessel(self.dim / 2 - 2, self.kappa) - bessel(self.dim / 2, kappa)) / self.bessel(kappa)
+        return (bessel(self.dim / 2 - 2, kappa) - bessel(self.dim / 2, kappa)) / self.bessel(kappa)
