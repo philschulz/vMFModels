@@ -1,19 +1,20 @@
-import argparse, sys, os, warnings
-
+import argparse, sys, os
 # warnings.filterwarnings("error")
 # necessary for processing on cluster
-import datetime, logging
-from collections import Counter
+import datetime
+import logging
 import random as r
+from collections import Counter
+from typing import Tuple, List, Dict, Optional
 
 import numpy as np
 from gensim.models import Word2Vec, KeyedVectors
-from scipy.special import iv as bessel, psi
 from scipy.misc import logsumexp
-from typing import Tuple, List, Dict, Optional
+from scipy.special import iv as bessel, psi
 
 from utils import functions as f
-from vmf.vmf_distribution import VMF
+from utils.gamma_distribution import GammaDist
+from utils.vmf_distribution import VMF
 
 
 def read_corpus(path_to_source: str, path_to_target: str, source_embeddings: Word2Vec) -> Tuple[
@@ -75,7 +76,7 @@ def read_corpus(path_to_source: str, path_to_target: str, source_embeddings: Wor
 
 class BatchIterator(object):
     def __init__(self, corpus: List[Tuple[List[int], List[int]]], batch_size: int, shuffle: bool = True):
-        self.corpus = corpus
+        self.corpus = corpus.copy()
         if shuffle:
             r.shuffle(corpus)
         self.corpus_size = len(corpus)
@@ -83,8 +84,9 @@ class BatchIterator(object):
         self.shuffle = shuffle
         self.stop = False
         self.index = 0
+        self.batch_num = 0
 
-    def next(self):
+    def next(self) -> List[Tuple[List[int], List[int]]]:
         """
         Return the next batch.
 
@@ -93,23 +95,25 @@ class BatchIterator(object):
         start = self.index
         end = self.index + self.batch_size
         self.index = end
+        self.batch_num += 1
 
-        if end > self.corpus_size + self.batch_size:
-            return None
-        elif end > self.corpus_size:
+        if end >= self.corpus_size + self.batch_size:
+            return None, self.batch_num
+        elif end >= self.corpus_size:
             missing = end - self.corpus_size
             batch = self.corpus[start:]
             # fill up batch with initial sentences
             batch += self.corpus[:end]
-            return batch
+            return batch, self.batch_num
         else:
-            return self.corpus[start:end]
+            return self.corpus[start:end], self.batch_num
 
-    def reset(self):
+    def reset(self) -> None:
         """
         Reset this iterator.
         """
         self.index = 0
+        self.batch_num = 0
         if self.shuffle:
             r.shuffle(self.corpus)
 
@@ -148,7 +152,12 @@ class VMFIBM1(object):
         self.source_embeddings = source_embeddings
         self.source_tokens = source_tokens
         self.target_vocab = target_vocab
-        self.bessel_ratio = lambda x: bessel(dim/2, x) / bessel(dim/1, x)
+        self.bessel_ratio = lambda x: bessel(dim / 2, x) / bessel(dim / 2 - 1, x)
+
+        # gamma prior
+        self.gamma_prior = GammaDist(1, 1)
+        self.prior_shape = 1
+        self.prior_rate = 1
 
         # vMF mean parameters
         self.vMF_natural_params = np.random.normal(size=(len(self.target_vocab), dim)) if random_initial_directions \
@@ -156,10 +165,11 @@ class VMFIBM1(object):
         self.target_directions = self.normalise(self.vMF_natural_params)
 
         # vMF concentration parameters and noise
-        self.target_norm_means = np.ones((len(self.target_vocab),1)) # * dim
-        self.target_norm_std_embed = np.ones((len(self.target_vocab),1))
+        self.target_norm_means = np.ones((len(self.target_vocab), 1))  # * dim
+        self.target_norm_std_embed = np.ones((len(self.target_vocab), 1))
         self.noise_samples = None
 
+        # prior on mean directions
         self.mu_0 = self.normalise(np.ones(dim))
         self.kappa_0 = 1
         self.init = random_initial_directions
@@ -167,6 +177,9 @@ class VMFIBM1(object):
         self.fix_concentration = concentration_fix is not None
         if concentration_fix:
             self.target_concentration = concentration_fix
+
+        # logger
+        self.logger = logger
 
     def _random_init_directions(self) -> np.array:
         """
@@ -181,11 +194,16 @@ class VMFIBM1(object):
         :param corpus: The corpus to be aligned.
         :param out_file: Path to the file to which the output gets written.
         """
+        # Set noises to 1 to get mean of Gaussian variational approximation
+        self.noise_samples = np.ones(shape=self.target_norm_std_embed.shape)
 
         with open(out_file, 'w') as out:
             for s_sent, t_sent in corpus:
-                # TODO change target concentration
-                scores = self.vmf.log_density(s_sent, t_sent, self.target_directions, self.target_concentration)
+                source_embeddings = self.source_embeddings[s_sent]
+                target_directions = self.target_directions[t_sent]
+
+                target_concentrations, _, _, _ = self._compute_concentration(t_sent)
+                scores, _ = self.vmf.log_density(source_embeddings, target_directions, target_concentrations)
                 links = np.argmax(scores, axis=1) - 1
 
                 output = list()
@@ -199,10 +217,18 @@ class VMFIBM1(object):
         iterator = BatchIterator(corpus, batch_size)
 
         for i in range(iterations):
-            print("Starting iteration {} at {}".format(i + 1, datetime.datetime.now()))
+            self.logger.info("Starting epoch {}".format(i + 1))
 
-            batch = iterator.next()
+            batch, batch_num = iterator.next()
             while batch is not None:
+
+                # mean_direction = np.mean(self.target_directions, axis=0)
+                # mean_mean = np.mean(self.target_norm_means)
+                # mean_std = np.mean(self.target_norm_std_embed)
+                #
+                # self.logger.debug("Mean direction for batch = {}".format(mean_direction))
+                # self.logger.debug('Variational mean for kappa = {}'.format(mean_mean))
+                # self.logger.debug('Variationl std embedding for kappa = {}'.format(mean_std))
 
                 self.noise_samples = np.random.normal(loc=0, scale=1, size=self.target_norm_std_embed.shape)
                 log_likelihood = 0
@@ -215,23 +241,42 @@ class VMFIBM1(object):
                     data_points += len(source_sent)
                     log_marginal, expected_ss, var_mean_grad, var_std_grad = self.compute_expectations(
                         source_sent, target_sent)
-                    # print("grad = {}".format(var_std_grad))
                     log_likelihood += log_marginal
                     target_ss[target_sent] += expected_ss
                     mean_grad[target_sent] += var_mean_grad
                     std_grad[target_sent] += var_std_grad
 
-                print("Log-likelihood: {}".format(log_likelihood))
+                self.logger.info("Log-likelihood at batch {}: {}".format(batch_num, log_likelihood))
 
                 target_ss *= self.source_tokens / data_points
                 mean_grad /= data_points
                 std_grad /= data_points
 
-                print('Starting to udpdate params at {}'.format(datetime.datetime.now()))
+                self.logger.info('Updating variational parameters')
                 self.update_params(target_ss, mean_grad, std_grad)
-                batch = iterator.next()
+                batch, batch_num = iterator.next()
+                print(type(batch))
 
             iterator.reset()
+
+    def _compute_concentration(self, target_sentence: List[int]) -> Tuple[np.array, np.array]:
+        """
+        Compute the concentration parameters for the target_sentence.
+
+        :param target_sentence: The target sentence.
+        :return: The concentration parameters and softplus gradients.
+        """
+        if self.fix_concentration:
+            kappa = self.target_concentration
+            soft_plus_grad = None
+        else:
+            target_var_means = self.target_norm_means[target_sentence]
+            target_var_stds = np.exp(self.target_norm_std_embed[target_sentence])
+            epsilon = self.noise_samples[target_sentence]
+            z = target_var_means + target_var_stds * epsilon
+            kappa, soft_plus_grad = f.soft_plus(z)
+
+        return kappa, target_var_stds, epsilon, soft_plus_grad
 
     def compute_expectations(self, source_sent: List[int], target_sent: List[int]) -> None:
         """
@@ -242,22 +287,11 @@ class VMFIBM1(object):
         """
         source_vecs = self.source_embeddings[source_sent]
         target_directions = self.target_directions[target_sent]
-
-        # print(target_directions)
-
-        if self.fix_concentration:
-            kappa = self.target_concentration
-        else:
-            target_var_means = self.target_norm_means[target_sent]
-            target_var_stds = np.exp(self.target_norm_std_embed[target_sent])
-
-            kl_mean_grad, kl_std_grad = f.diagonal_gaussian_kl_grad(target_var_means, target_var_stds)
-
-            epsilon = self.noise_samples[target_sent]
-            z = target_var_means + target_var_stds * epsilon
-            kappa, _ = f.soft_plus(z)
+        kappa, target_var_stds, epsilon, soft_plus_grad = self._compute_concentration(target_sent)
 
         scores, kappa_grad = self.vmf.log_density(source_vecs, target_directions, kappa)
+        prior_scores, prior_grad = self.gamma_prior.log_density(kappa)
+        scores += prior_scores
 
         # compute posterior
         totals = logsumexp(scores, axis=0).reshape(len(source_sent), 1)
@@ -270,14 +304,16 @@ class VMFIBM1(object):
         observed_vecs = np.dot(posteriors, source_vecs)
 
         if self.fix_concentration:
-            return log_marginal, observed_vecs, np.zeros((len(target_sent),1)), np.zeros((len(target_sent),1))
+            return log_marginal, observed_vecs, np.zeros((len(target_sent), 1)), np.zeros((len(target_sent), 1))
 
+        # model gradient
+        kappa_grad += prior_grad
+        # model transformation
+        z_grad = kappa_grad * soft_plus_grad
         # add gradient of log-jacobian
-        kappa_grad += f.sigmoid(-kappa)
-        var_mean_grad = kappa_grad - len(source_sent) * kl_mean_grad[:, np.newaxis]
+        var_mean_grad = z_grad + f.sigmoid(-kappa)
         # multiply with gradients of std normal and embedding transformation
-        var_std_grad = kappa_grad * epsilon * target_var_stds - kl_std_grad[:, np.newaxis]
-
+        var_std_grad = var_mean_grad * epsilon * target_var_stds + 1
 
         return log_marginal, observed_vecs, var_mean_grad, var_std_grad
 
@@ -291,11 +327,12 @@ class VMFIBM1(object):
         :param variational_std_gradient: Gradient of the embedding of the variational standard deviation.
         """
         # TODO make learning rate adjustable
-        self.update_target_params(direction_ss, variational_mean_gradient, variational_std_gradient, 0.001)
+        self.update_target_params(direction_ss, variational_mean_gradient, variational_std_gradient, 0.00001)
         self.update_global_params()
 
     def _update_target_directions(self, direction_ss: np.array, learning_rate: int) -> None:
         prior_ss = self.kappa_0 * self.mu_0
+        # self.logger.debug('Prior ss during update = {}'.format(prior_ss))
 
         if self.fix_concentration:
             target_concentrations = self.target_concentration
@@ -303,17 +340,21 @@ class VMFIBM1(object):
             target_concentrations = self.target_norm_means + np.exp(self.target_norm_std_embed) * self.noise_samples
             target_concentrations = target_concentrations.reshape((target_concentrations.size, 1))
 
-        # scale expected ss to corpus size
-        direction_ss *= self.source_tokens
+        # target_concentrations_mean = np.mean(target_concentrations)
+        # self.logger.debug("Mean target concentration = {}".format(target_concentrations_mean))
+
         # update natural parameter estimates
+        # self.logger.debug('natural params mean before update = {}'.format(np.mean(self.vMF_natural_params, axis=0)))
         natural_params = target_concentrations * direction_ss + prior_ss
         self.vMF_natural_params += learning_rate * (natural_params - self.vMF_natural_params)
+        # self.logger.debug('natural params mean after update = {}'.format(np.mean(self.vMF_natural_params, axis=0)))
 
         # compute expected mean directions
         target_means = self.normalise(self.vMF_natural_params)
         self.target_directions = target_means * self.bessel_ratio(target_concentrations)
 
-    def _update_target_concentrations(self, variational_mean_grad:np.array, variational_std_grad: np.array, learning_rate) -> None:
+    def _update_target_concentrations(self, variational_mean_grad: np.array, variational_std_grad: np.array,
+                                      learning_rate) -> None:
         self.target_norm_means += learning_rate * variational_mean_grad
         self.target_norm_std_embed += learning_rate * variational_std_grad
 
@@ -364,11 +405,14 @@ class VMFIBM1(object):
         :param path_to_file: Path to the output file.
         """
         with open(path_to_file + ".means", "w") as means, open(path_to_file + ".concentration", "w") as conc:
-            means.write(str(len(self.target_means)) + " " + str(self.dim) + "\n")
+            means.write(str(self.target_directions.shape[0]) + " " + str(self.dim) + "\n")
             # no embedding needed for NULL word
+            kappas, _ = f.soft_plus(self.target_norm_means + np.exp(self.target_norm_std_embed))
+
             for word, idx in self.target_vocab.items():
+                # TODO think about what to do here -> use mean parameter or expected mean
                 mean_direction = self.target_directions[idx]
-                kappa = self.target_concentrations[idx]
+                kappa = kappas[idx]
                 means.write(word + " " + ' '.join(map(str, mean_direction)) + "\n")
                 conc.write(word + ' ' + str(kappa) + "\n")
 
@@ -453,7 +497,7 @@ class VMFIBM1Mult(VMFIBM1):
 def main():
     command_line_parser = argparse.ArgumentParser("This is word alignment tool that uses word vectors on the source"
                                                   "side.")
-    command_line_parser.add_argument('--model', '-m', type=str, default="vmf",
+    command_line_parser.add_argument('--model', '-m', type=str, default="vmf_alignment",
                                      help="Specify the model to be used during"
                                           "alignment.")
     command_line_parser.add_argument('--source', '-s', type=str, required=True,
@@ -497,21 +541,35 @@ def main():
     fix = args.fix_target_concentration
     cap = args.concentration_cap
 
-    print("Loading embeddings at {}".format(datetime.datetime.now()))
+    embedding_output_prefix = "target"
+
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    handler = logging.StreamHandler(stream=sys.stdout)
+    formatter = logging.Formatter(fmt='%(asctime)s [%(levelname)s]: %(message)s')
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+    logger.info("Loading embeddings from {}".format(args.embeddings))
     embeddings = KeyedVectors.load_word2vec_format(args.embeddings, binary=args.binary)
 
-    print("Constructing corpus at {}".format(datetime.datetime.now()))
+    logger.info("Constructing corpus")
     corpus, source_map, target_map, source_mean_direction, source_tokens = \
         read_corpus(args.source, args.target, embeddings)
     dim = embeddings.vector_size
 
-    aligner = VMFIBM1(dim, source_map, source_tokens, target_map, True, cap, fix) \
+    aligner = VMFIBM1(dim, source_map, source_tokens, target_map, True, cap, fix, logger=logger) \
         if model == "vmf" else VMFIBM1Mult(dim, source_map, target_map, dir)
     aligner.train(corpus, iterations, batch_size)
 
-    print("Starting to align at {}".format(datetime.datetime.now()))
+    logger.info("Starting to align")
     aligner.align(corpus, out_file)
-    aligner.write_param("target")
+    logger.info("Alignment finished")
+
+    logger.info(
+        "Writing learned parameters to files with prefix {}".format(os.path.join(os.getcwd(), embedding_output_prefix)))
+    aligner.write_param(embedding_output_prefix)
 
 
 if __name__ == "__main__":

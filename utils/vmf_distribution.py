@@ -8,18 +8,23 @@ class VMF(object):
         self.dim = dim
         self.bessel = lambda x: bessel(dim / 2 - 1, x)
 
+    # TODO acount for the fact that we are processing multiple data points at once
     def log_density(self, data: np.array, mu: np.array, kappa: np.array) -> Tuple[np.array, np.array]:
         '''
         Compute the vMF log-likelihood.
 
         :param data: A data batch. Shape: (batch_size, embed_dim).
+        :param mu: The vMF mean directions.
+        :param kappa: The vMF concentrations.
         :return: Density and kappa gradients. Shape of both: (batch_size, 1)
         '''
-        normaliser = (np.log(kappa) * (self.dim / 2 - 1) - np.log(self.bessel(kappa)))
+        data_points = data.shape[0]
+        normaliser = (np.log(kappa) * (self.dim / 2 - 1) - np.log(self.bessel(kappa))) - (self.dim/2) * np.log(2*np.pi)
+        normaliser *= data_points
         energy = np.dot(mu, data.T)
         density = normaliser + energy * kappa
         kappa_grad = (self.dim / 2 - 1) / kappa - self.__log_bessel_gradient(kappa)
-        kappa_grad = data.shape[0] * kappa_grad + np.sum(energy, axis=1)[:,np.newaxis]
+        kappa_grad = data_points * kappa_grad + np.sum(energy, axis=1)[:,np.newaxis]
 
         # if np.any(np.isnan(density)):
         #     print(density)
