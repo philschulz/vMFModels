@@ -153,6 +153,7 @@ class VMFIBM1(object):
         self.source_tokens = source_tokens
         self.target_vocab = target_vocab
         self.bessel_ratio = lambda x: bessel(dim / 2, x) / bessel(dim / 2 - 1, x)
+        self.corpus_scale = 1 / self.source_tokens
 
         # gamma prior
         self.gamma_prior = GammaDist(1, 1)
@@ -249,13 +250,12 @@ class VMFIBM1(object):
                 self.logger.info("Log-likelihood at batch {}: {}".format(batch_num, log_likelihood))
 
                 target_ss *= self.source_tokens / data_points
-                mean_grad /= data_points
-                std_grad /= data_points
+                mean_grad *= self.source_tokens / data_points
+                std_grad *= self.source_tokens / data_points
 
                 self.logger.info('Updating variational parameters')
                 self.update_params(target_ss, mean_grad, std_grad)
                 batch, batch_num = iterator.next()
-                print(type(batch))
 
             iterator.reset()
 
@@ -287,11 +287,14 @@ class VMFIBM1(object):
         """
         source_vecs = self.source_embeddings[source_sent]
         target_directions = self.target_directions[target_sent]
-        kappa, target_var_stds, epsilon, soft_plus_grad = self._compute_concentration(target_sent)
+        epsilon = self.noise_samples[target_sent]
+        kappa, target_var_stds, z, soft_plus_grad = self._compute_concentration(target_sent)
+        data_points = len(source_sent)
 
         scores, kappa_grad = self.vmf.log_density(source_vecs, target_directions, kappa)
         prior_scores, prior_grad = self.gamma_prior.log_density(kappa)
-        scores += prior_scores
+        # add log-Jacobian term
+        scores += data_points * self.corpus_scale * (prior_scores + np.log(f.sigmoid(z)))
 
         # compute posterior
         totals = logsumexp(scores, axis=0).reshape(len(source_sent), 1)
@@ -306,12 +309,12 @@ class VMFIBM1(object):
         if self.fix_concentration:
             return log_marginal, observed_vecs, np.zeros((len(target_sent), 1)), np.zeros((len(target_sent), 1))
 
-        # model gradient
-        kappa_grad += prior_grad
-        # model transformation
-        z_grad = kappa_grad * soft_plus_grad
+        # likelihood gradient
+        kappa_grad *= soft_plus_grad
+        # transformed prior gradient
+        prior_grad = data_points * self.corpus_scale * (prior_grad * soft_plus_grad + f.sigmoid(-z))
         # add gradient of log-jacobian
-        var_mean_grad = z_grad + f.sigmoid(-kappa)
+        var_mean_grad = kappa_grad + prior_grad
         # multiply with gradients of std normal and embedding transformation
         var_std_grad = var_mean_grad * epsilon * target_var_stds + 1
 
@@ -355,6 +358,13 @@ class VMFIBM1(object):
 
     def _update_target_concentrations(self, variational_mean_grad: np.array, variational_std_grad: np.array,
                                       learning_rate) -> None:
+
+        # clip gradients
+        mean_idx = np.abs(variational_mean_grad) > 10
+        var_idx = np.abs(variational_std_grad) > 10
+        variational_mean_grad[mean_idx] = np.sign(variational_mean_grad[mean_idx]) * 10
+        variational_std_grad[var_idx] = np.sign(variational_std_grad[var_idx]) * 10
+
         self.target_norm_means += learning_rate * variational_mean_grad
         self.target_norm_std_embed += learning_rate * variational_std_grad
 
@@ -516,7 +526,7 @@ def main():
                                           "binary or text format.")
     command_line_parser.add_argument('--batch-size', type=int, required=True,
                                      help="The batch size for training.")
-    command_line_parser.add_argument('--iter', '-i', type=int, default=10, help="Set the number of iterations used for "
+    command_line_parser.add_argument('--iter', '-i', type=int, default=3, help="Set the number of iterations used for "
                                                                                 "training.")
     command_line_parser.add_argument('--out-file', '-o', type=str, default="alignments", help="Path to the file to"
                                                                                               "which the output alignments shall be printed")
@@ -529,8 +539,15 @@ def main():
                                           "combined categorical and vMF model.")
     command_line_parser.add_argument("--fix-target-concentration", type=float,
                                      help="Set fixed concentration parameter for all target words.")
-    command_line_parser.add_argument("--concentration-cap", type=float,
-                                     help="Caps the possible concentration values at a maximum.")
+    command_line_parser.add_argument("--learning-rate", "--r", type=float, default=0.0001,
+                                     help="Set the (initial) learning rate used during optmisation. "
+                                          "Default: %(default)s.")
+    command_line_parser.add_argument("--clip-gradient", type=float, default=10,
+                                     help="The likelihood term yields rather big gradient estimates which need to be "
+                                          "clipped to avoid numerical problems. This option specifies the cut-off "
+                                          "point. Default: %(default)s.")
+    command_line_parser.add_argument("--optimiser", type=str, choices=["sgd", "adagrad"], default="sgd",
+                                     help="Choose an optimiser from %(choices)s. Default: %(default)s.")
 
     args = command_line_parser.parse_args()
     model = args.model
