@@ -144,7 +144,7 @@ class VMFIBM1(object):
         return x / np.linalg.norm(x, axis=1).reshape(x.shape[0], 1) if len(x.shape) > 1 else x / np.linalg.norm(x)
 
     def __init__(self, dim: int, source_embeddings: np.array, source_tokens: int, target_vocab: Dict[int, str],
-                 random_initial_directions: bool = False, concentration_cap: Optional[int] = None,
+                 random_initial_directions: bool = False,
                  concentration_fix: Optional[int] = None, logger: Optional[logging.Logger] = None):
 
         self.dim = dim
@@ -162,7 +162,7 @@ class VMFIBM1(object):
 
         # vMF mean parameters
         self.vMF_natural_params = np.random.normal(size=(len(self.target_vocab), dim)) if random_initial_directions \
-            else np.zeros((len(self.target_vocab), dim))
+            else np.ones((len(self.target_vocab), dim))
         self.target_directions = self.normalise(self.vMF_natural_params)
 
         # vMF concentration parameters and noise
@@ -174,7 +174,6 @@ class VMFIBM1(object):
         self.mu_0 = self.normalise(np.ones(dim))
         self.kappa_0 = 1
         self.init = random_initial_directions
-        self.concentration_cap = concentration_cap
         self.fix_concentration = concentration_fix is not None
         if concentration_fix:
             self.target_concentration = concentration_fix
@@ -401,10 +400,8 @@ class VMFIBM1(object):
         # TODO Fix this! kappa is somethimes negative which should be impossible
         kappa = ((r * self.dim) / (1 - np.power(r, 2))) + 1e-10
 
-        if self.concentration_cap:
-            kappa[kappa > self.concentration_cap] = self.concentration_cap
         # TODO only needed for debugging -> remove
-        elif np.any(kappa < 0):
+        if np.any(kappa < 0):
             print(kappa[kappa < 0])
         return kappa, r
 
@@ -556,7 +553,6 @@ def main():
     batch_size = args.batch_size
     dir = args.dirichlet_param
     fix = args.fix_target_concentration
-    cap = args.concentration_cap
 
     embedding_output_prefix = "target"
 
@@ -576,7 +572,7 @@ def main():
         read_corpus(args.source, args.target, embeddings)
     dim = embeddings.vector_size
 
-    aligner = VMFIBM1(dim, source_map, source_tokens, target_map, True, cap, fix, logger=logger) \
+    aligner = VMFIBM1(dim, source_map, source_tokens, target_map, True, fix, logger=logger) \
         if model == "vmf" else VMFIBM1Mult(dim, source_map, target_map, dir)
     aligner.train(corpus, iterations, batch_size)
 
