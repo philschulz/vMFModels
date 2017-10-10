@@ -24,10 +24,9 @@ def clip_gradient(grad: np.array, threshold: float) -> np.array:
     :param threshold: The treshold.
     :return: The clipped gradients.
     """
-    # TODO adjust this for axes of higher-dim tensors
-    norms = np.linalg.norm(grad, axis=1)
+    norms = np.linalg.norm(grad, axis=grad.ndim - 1)
     idx = norms > threshold
-    grad[idx] = threshold * grad[idx] / norms[idx]
+    grad[idx] = threshold * grad[idx] / norms[idx].reshape(norms[idx].size, 1)
 
     return grad
 
@@ -58,7 +57,7 @@ class Optimiser(ABC):
         self.gradient_clipping = gradient_clipping
 
     @abstractmethod
-    def compute_updates(self, gradients: list[np.array]) -> List[np.array]:
+    def __call__(self, *gradients: np.array) -> List[np.array]:
         """
         Computes the update given the current gradients.
 
@@ -82,7 +81,7 @@ class SGD(Optimiser):
         super().__init__(learning_rate, gradient_clipping)
         self.decay_rate = decay_rate
 
-    def compute_updates(self, gradients: list[np.array]):
+    def __call__(self, *gradients: np.array) -> List[np.array]:
         """
         Computes the update given the current gradients.
 
@@ -117,7 +116,7 @@ class AdaGrad(Optimiser):
         super().__init__(learning_rate, gradient_clipping)
         self.gradient_history = [np.zeros(param.shape) for param in params]
 
-    def compute_updates(self, gradients: List[np.array]) -> List[np.array]:
+    def __call__(self, *gradients: np.array) -> List[np.array]:
         """
         Computes the update given the current gradients.
 
@@ -148,12 +147,12 @@ class AdaDelta(AdaGrad):
 
     def __init__(self, params: List[np.array], learning_rate: float = DEFAULT_LEARNING_RATE, decay_rate: float = 0.95,
                  gradient_clipping: Optional[float] = 0):
-        super().__init__(params, learning_rate=0, gradient_clipping=gradient_clipping)
+        super().__init__(params, learning_rate=learning_rate, gradient_clipping=gradient_clipping)
         self.update_history = [np.zeros(param.shape) for param in params]
         self.decay_rate = decay_rate
         self.init = False
 
-    def compute_updates(self, gradients: list[np.array]) -> List[np.array]:
+    def __call__(self, *gradients: np.array) -> List[np.array]:
         """
         Computes the update given the current gradients.
 
@@ -165,11 +164,11 @@ class AdaDelta(AdaGrad):
         for idx, grad in enumerate(gradients):
             if self.gradient_clipping > 0:
                 grad = clip_gradient(grad, self.gradient_clipping)
-            learning_rate = compute_rmse(self.udpate_history[idx]) if self.init else self.learning_rate
-            self.gradient_history[idx] = self.decay_rate * self.gradient_history + (1 - self.decay_rate) * np.square(
+            learning_rate = compute_rmse(self.update_history[idx]) if self.init else self.learning_rate
+            self.gradient_history[idx] = self.decay_rate * self.gradient_history[idx] + (1 - self.decay_rate) * np.square(
                 grad)
             update = learning_rate * grad / compute_rmse(self.gradient_history[idx])
-            self.update_history[idx] = self.decay_rate * self.update_history + (1 - self.decay_rate) * np.square(update)
+            self.update_history[idx] = self.decay_rate * self.update_history[idx] + (1 - self.decay_rate) * np.square(update)
             updates.append(update)
 
         self.init = True
