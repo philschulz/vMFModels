@@ -23,12 +23,8 @@ class VMF(object):
         energy = np.dot(mu, data.T)
         density = normaliser + energy * kappa
         kappa_grad = (self.dim / 2 - 1) / kappa - self.__log_bessel_gradient(kappa)
-        kappa_grad = data_points * kappa_grad + np.sum(energy, axis=1)[:,np.newaxis]
-        mu_grad = kappa * np.sum(data, axis=0)
-
-        # if np.any(np.isnan(density)):
-        #     print(density)
-        #     print("kappa = {}".format(kappa))
+        kappa_grad = data_points * kappa_grad + np.sum(energy, axis=energy.ndim - 1, keepdims=True)
+        mu_grad = kappa * np.sum(data, axis=data.ndim - 2)
 
         return density, mu_grad, kappa_grad
 

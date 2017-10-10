@@ -1,7 +1,6 @@
 import argparse, sys, os
 # warnings.filterwarnings("error")
 # necessary for processing on cluster
-import datetime
 import logging
 import random as r
 from collections import Counter
@@ -31,8 +30,7 @@ def read_corpus(path_to_source: str, path_to_target: str, source_embeddings: Wor
     and the (normalised) mean direction of source vectors
     """
     source_map = dict()
-    # TODO adjust dim
-    source2vec = np.zeros(50)
+    source2vec = np.zeros(source_embeddings.vector_size)
     source_mean_direction = 0
     target_map = {"NULL": 0}
     corpus = list()
@@ -127,8 +125,9 @@ class VMFIBM1(object):
     :param source_embeddings: Embedding matrix for the source vocabulary.
     :param source_tokens: Number of source tokens.
     :param target_vocab: Target vocabulary.
-    :param random_initial_directions: Have all initial target vectors point in random directions.
-    :param concentration_cap: Maximal concentration value.
+    :param optimiser: An optimiser to update the parameters.
+    :param mc_decoder: Number of samples to take for MC decoding. The mean transformed concentration is used if this
+    value is 0.
     :param concentration_fix: Value for fixed concentration parameters.
     :param logger: A logger for events during processing.
     """
@@ -142,12 +141,11 @@ class VMFIBM1(object):
         :param x: The vector.
         :return: The normalised vector.
         """
-        return x / np.linalg.norm(x, axis=1).reshape(x.shape[0], 1) if len(x.shape) > 1 else x / np.linalg.norm(x)
+        return x / np.linalg.norm(x, axis=x.ndim - 1, keepdims=True)
 
-    # TODO: properly integrate optimiser
     def __init__(self, dim: int, source_embeddings: np.array, source_tokens: int, target_vocab: Dict[int, str],
                  optimiser: Optimiser,
-                 random_initial_directions: bool = False,
+                 mc_decode: Optional[int] = 0,
                  concentration_fix: Optional[int] = None,
                  logger: Optional[logging.Logger] = None):
 
@@ -158,27 +156,27 @@ class VMFIBM1(object):
         self.target_vocab = target_vocab
         self.bessel_ratio = lambda x: bessel(dim / 2, x) / bessel(dim / 2 - 1, x)
         self.corpus_scale = 1 / self.source_tokens
+        self.mc_decode = mc_decode
 
         # gamma prior
-        self.gamma_prior = GammaDist(1, 1)
+        self.gamma_prior = GammaDist(1, 100)
 
         # vMF mean parameters
-        self.vMF_natural_params = np.random.normal(size=(len(self.target_vocab), dim)) if random_initial_directions \
-            else np.zeros((len(self.target_vocab), dim))
+        self.vMF_natural_params = np.random.normal(size=(len(self.target_vocab), dim))
         self.target_directions = self.normalise(self.vMF_natural_params)
 
         # vMF concentration parameters and noise
-        self.target_norm_means = np.ones((len(self.target_vocab), 1))  # * dim
-        self.target_norm_std_embed = np.ones((len(self.target_vocab), 1))
+        self.target_norm_means = np.zeros((len(self.target_vocab), 1))  # * dim
+        self.target_norm_std_embed = np.zeros((len(self.target_vocab), 1))
         self.noise_samples = None
         self.target_concentration = np.ones(
             self.target_norm_std_embed.shape) * concentration_fix if concentration_fix else None
         self.fix_concentration = concentration_fix is not None
 
         # prior on mean directions
-        self.mu_0 = np.mean(self.source_embeddings, axis=0)
-        self.kappa_0 = np.array([dim])
-        self.init = random_initial_directions
+        self.mu_0 = self.normalise(
+            np.random.normal(size=(1, self.source_embeddings.shape[1])))  # np.mean(self.source_embeddings, axis=0)
+        self.kappa_0 = np.array([dim], dtype=np.float64)
         self.fix_concentration = concentration_fix is not None
 
         # initialise optimiser
@@ -188,12 +186,6 @@ class VMFIBM1(object):
 
         # logger
         self.logger = logger
-
-    def _random_init_directions(self) -> np.array:
-        """
-        Randomly initialise the directions of the target embeddings.
-        """
-        return self.normalise(np.random.normal(loc=0, scale=1, size=(len(self.target_vocab), self.dim)))
 
     def align(self, corpus: List[Tuple[List[int], List[int]]], out_file: str, format: str = "moses") -> None:
         """
@@ -210,7 +202,15 @@ class VMFIBM1(object):
                 source_embeddings = self.source_embeddings[s_sent]
                 target_directions = self.target_directions[t_sent]
 
-                target_concentrations, _, _, _ = self._compute_concentration(t_sent)
+                scores = np.zeros((len(t_sent), len(s_sent)))
+                if self.mc_decode > 0:
+                    for _ in range(self.mc_decode):
+                        target_concentrations = self._sample_concentration(t_sent)
+                        sample_scores, *_ = self.vmf.log_density(source_embeddings, target_directions,
+                                                                 target_concentrations)
+                        scores += sample_scores
+                else:
+                    target_concentrations, *_ = self._compute_concentration(t_sent)
                 scores, *_ = self.vmf.log_density(source_embeddings, target_directions, target_concentrations)
                 links = np.argmax(scores, axis=1) - 1
 
@@ -221,6 +221,14 @@ class VMFIBM1(object):
 
                 out.write(" ".join(output) + "\n")
 
+    def _sample_concentration(self, target_sentence: List[int]) -> np.array:
+        target_var_means = self.target_norm_means[target_sentence]
+        target_var_stds = np.exp(self.target_norm_std_embed[target_sentence])
+        epsilon = np.random.normal(size=target_var_stds.shape)
+        z = target_var_means + target_var_stds * epsilon
+        kappa, soft_plus_grad = f.soft_plus(z)
+        return kappa
+
     def train(self, corpus: List[Tuple[List[int], List[int]]], iterations: int, batch_size: int) -> None:
         iterator = BatchIterator(corpus, batch_size)
 
@@ -230,13 +238,13 @@ class VMFIBM1(object):
             batch, batch_num = iterator.next()
             while batch is not None:
 
-                # mean_direction = np.mean(self.target_directions, axis=0)
-                # mean_mean = np.mean(self.target_norm_means)
-                # mean_std = np.mean(self.target_norm_std_embed)
-                #
-                # self.logger.debug("Mean direction for batch = {}".format(mean_direction))
-                # self.logger.debug('Variational mean for kappa = {}'.format(mean_mean))
-                # self.logger.debug('Variational std embedding for kappa = {}'.format(mean_std))
+                mean_direction = np.mean(self.target_directions, axis=0)
+                mean_mean = np.mean(self.target_norm_means)
+                mean_std = np.mean(self.target_norm_std_embed)
+
+                self.logger.debug("Mean direction for batch = {}".format(mean_direction))
+                self.logger.debug('Variational mean for kappa = {}'.format(mean_mean))
+                self.logger.debug('Variational std embedding for kappa = {}'.format(mean_std))
 
                 self.noise_samples = np.random.normal(loc=0, scale=1, size=self.target_norm_std_embed.shape)
                 log_likelihood = 0
@@ -254,6 +262,12 @@ class VMFIBM1(object):
                     mean_grad[target_sent] += var_mean_grad
                     std_grad[target_sent] += var_std_grad
 
+                # integrate density from top-level distribution
+                log_likelihood *= self.source_tokens / data_points
+                prior_density, *_ = self.vmf.log_density(np.sum(self.target_directions, axis=0, keepdims=True),
+                                                         self.mu_0, self.kappa_0)
+                prior_density = np.sum(prior_density)
+                log_likelihood += prior_density
                 self.logger.info("Log-likelihood at batch {}: {}".format(batch_num, log_likelihood))
 
                 target_ss *= self.source_tokens / data_points
@@ -340,46 +354,11 @@ class VMFIBM1(object):
         :param variational_mean_gradient: Gradient of the mean of the variational Gaussian.
         :param variational_std_gradient: Gradient of the embedding of the variational standard deviation.
         """
-        # TODO make learning rate adjustable
-        self.update_target_params(direction_ss, variational_mean_gradient, variational_std_gradient, 0.00001)
+        self.update_target_params(direction_ss, variational_mean_gradient, variational_std_gradient)
         self.update_global_params()
 
-    # TODO erase this if updates work
-    def _update_target_directions(self, direction_ss: np.array, learning_rate: int) -> None:
-        prior_ss = self.kappa_0 * self.mu_0
-        # self.logger.debug('Prior ss during update = {}'.format(prior_ss))
-
-        target_concentrations, *_ = self._compute_concentration()
-
-        # target_concentrations_mean = np.mean(target_concentrations)
-        # self.logger.debug("Mean target concentration = {}".format(target_concentrations_mean))
-
-        # update natural parameter estimates
-        # self.logger.debug('natural params mean before update = {}'.format(np.mean(self.vMF_natural_params, axis=0)))
-        natural_params = target_concentrations * direction_ss + prior_ss
-        natural_gradient = natural_params - self.vMF_natural_params
-        self.vMF_natural_params += learning_rate * (natural_params - self.vMF_natural_params)
-        # self.logger.debug('natural params mean after update = {}'.format(np.mean(self.vMF_natural_params, axis=0)))
-
-        # compute expected mean directions
-        target_means = self.normalise(self.vMF_natural_params)
-        self.target_directions = target_means * self.bessel_ratio(target_concentrations)
-
-    # TODO erase this if updates work
-    def _update_target_concentrations(self, variational_mean_grad: np.array, variational_std_grad: np.array,
-                                      learning_rate) -> None:
-
-        # clip gradients
-        mean_idx = np.abs(variational_mean_grad) > 10
-        var_idx = np.abs(variational_std_grad) > 10
-        variational_mean_grad[mean_idx] = np.sign(variational_mean_grad[mean_idx]) * 10
-        variational_std_grad[var_idx] = np.sign(variational_std_grad[var_idx]) * 10
-
-        self.target_norm_means += learning_rate * variational_mean_grad
-        self.target_norm_std_embed += learning_rate * variational_std_grad
-
     def update_target_params(self, direction_ss: np.array, variational_mean_grad: np.array,
-                             variational_std_grad: np.array, learning_rate: float) -> None:
+                             variational_std_grad: np.array) -> None:
         """
         Update the variational parameters and auxiliary quantities of the vMFs distributions associated with
         the target types.
@@ -390,48 +369,26 @@ class VMFIBM1(object):
         natural_gradient = natural_params - self.vMF_natural_params
 
         natural_param_upate, var_mean_update, var_std_embed_update = \
-            self.child_optimiser(list([natural_gradient, variational_mean_grad, variational_std_grad]))
+            self.child_optimiser(natural_gradient, variational_mean_grad, variational_std_grad)
 
         self.vMF_natural_params += natural_param_upate
-        self.target_norm_means += var_mean_update
-        self.target_norm_std_embed += var_std_embed_update
+        if not self.fix_concentration:
+            self.target_norm_means += var_mean_update
+            self.target_norm_std_embed += var_std_embed_update
 
         # compute expected mean directions
         target_means = self.normalise(self.vMF_natural_params)
         self.target_directions = target_means * self.bessel_ratio(target_concentrations)
 
-        # TODO erase this if updates work
-        # self._update_target_directions(direction_ss, learning_rate)
-        # if not self.fix_concentration:
-        #     self._update_target_concentrations(variational_mean_grad, variational_std_grad, learning_rate)
-
     def update_global_params(self) -> None:
         """Update the global parameters through empirical Bayes (MLE on expected params)"""
 
-        sum_of_means = np.sum(self.target_directions, axis=0)
-        self.mu_0 = self.normalise(sum_of_means)
-        self.kappa_0, _ = self.update_concentration(len(self.target_directions),
-                                                    sum_of_means.reshape((1, self.dim)))
+        ss = np.sum(self.target_directions, axis=0)
+        density, mu_grad, kappa_grad = self.vmf.log_density(ss, self.mu_0, self.kappa_0)
+        mu_update, kappa_update = self.root_optimiser(mu_grad, kappa_grad)
 
-    def update_concentration(self, num_observations: int, ss: np.array) -> Tuple[float, float]:
-        """
-        Update the concentration parameter of a vMF using empirical Bayes.
-
-        :param num_observations: The (expected) number of times this distribution has been observed
-        :param ss: The (expected) sufficient statistics for this distribution
-        :return: The updated concentration parameter
-        """
-        # TODO this is just a smoothing hack to make sure r != 1
-        r = np.linalg.norm(ss, axis=1) / (num_observations + 1)
-        # make sure that kappa is never 0 for numerical stability
-
-        # TODO Fix this! kappa is somethimes negative which should be impossible
-        kappa = ((r * self.dim) / (1 - np.power(r, 2))) + 1e-10
-
-        # TODO only needed for debugging -> remove
-        if np.any(kappa < 0):
-            print(kappa[kappa < 0])
-        return kappa, r
+        self.mu_0 += mu_update
+        self.kappa_0 += kappa_update
 
     def write_param(self, path_to_file: str) -> None:
         """
@@ -443,6 +400,7 @@ class VMFIBM1(object):
             means.write(str(self.target_directions.shape[0]) + " " + str(self.dim) + "\n")
             # no embedding needed for NULL word
             kappas, _ = f.soft_plus(self.target_norm_means + np.exp(self.target_norm_std_embed))
+            kappas = kappas.reshape((kappas.size,))
 
             for word, idx in self.target_vocab.items():
                 # TODO think about what to do here -> use mean parameter or expected mean
@@ -485,7 +443,7 @@ class VMFIBM1Mult(VMFIBM1):
         scores = self.log_density(source_sent, target_sent) if self.init else np.zeros(
             (len(source_sent), len(target_sent)))
         # sum rows
-        totals = logsumexp(scores, axis=1).reshape(len(source_sent), 1)
+        totals = logsumexp(scores, axis=1, keepdims=True)
         posteriors = np.exp(scores - totals)
 
         self.expected_target_counts[target_sent] += np.sum(posteriors, axis=0)
@@ -570,6 +528,10 @@ def main():
                                           "point. Default: %(default)s.")
     command_line_parser.add_argument("--optimiser", type=str, choices=["sgd", "adagrad", "adadelta"], default="sgd",
                                      help="Choose an optimiser from %(choices)s. Default: %(default)s.")
+    command_line_parser.add_argument("--mc-decoding", type=int,
+                                     help="Number of samples for MC decoding. Decoding will usually just take the "
+                                          "average unconstrained concentration (z). MC decoding instead samples values "
+                                          "of z.")
 
     args = command_line_parser.parse_args()
     model = args.model
