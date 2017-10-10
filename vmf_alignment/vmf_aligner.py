@@ -300,7 +300,7 @@ class VMFIBM1(object):
             z = target_var_means + target_var_stds * epsilon
             kappa, soft_plus_grad = f.soft_plus(z)
 
-        return kappa, target_var_stds, epsilon, soft_plus_grad
+        return kappa, target_var_stds, z, soft_plus_grad
 
     def compute_expectations(self, source_sent: List[int], target_sent: List[int]) -> None:
         """
