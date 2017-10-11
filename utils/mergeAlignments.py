@@ -412,6 +412,14 @@ def main():
                                  "grow-diag-final merger with the stronger requirement that yet unaligned words may "
                                  "only be linked to other yet unaligned words.")
 
+    heuristics.add_argument("--tgttosrc",
+                            action="store_true",
+                            help="Return the target to source alignments.")
+
+    heuristics.add_argument("--srctotgt",
+                            action="store_true",
+                            help="Return the source to target alignments.")
+
     args = vars(commandLineParser.parse_args())
     src2tgt_file = args["alignmentFiles"][0]
     tgt2src_file = args["alignmentFiles"][1]
