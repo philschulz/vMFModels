@@ -159,15 +159,15 @@ class VMFIBM1(object):
         self.mc_decode = mc_decode
 
         # gamma prior
-        self.gamma_prior = GammaDist(1, 100)
+        self.gamma_prior = GammaDist(2, 100)
 
         # vMF mean parameters
         self.vMF_natural_params = np.random.normal(size=(len(self.target_vocab), dim))
         self.target_directions = self.normalise(self.vMF_natural_params)
 
         # vMF concentration parameters and noise
-        self.target_norm_means = np.zeros((len(self.target_vocab), 1))  # * dim
-        self.target_norm_std_embed = np.zeros((len(self.target_vocab), 1))
+        self.target_norm_means = np.random.uniform(low=0, high=1, size=(len(self.target_vocab), 1))
+        self.target_norm_std_embed = np.random.uniform(low=0,high=1,size=(len(self.target_vocab), 1))
         self.noise_samples = None
         self.target_concentration = np.ones(
             self.target_norm_std_embed.shape) * concentration_fix if concentration_fix else None
@@ -182,7 +182,7 @@ class VMFIBM1(object):
         # initialise optimiser
         self.child_optimiser = optimiser(
             list([self.vMF_natural_params, self.target_norm_means, self.target_norm_std_embed]))
-        self.root_optimiser = optimiser(list([self.mu_0, self.kappa_0]))
+        self.root_optimiser = optimiser(list([self.mu_0]))
 
         # logger
         self.logger = logger
@@ -385,10 +385,9 @@ class VMFIBM1(object):
 
         ss = np.sum(self.target_directions, axis=0)
         density, mu_grad, kappa_grad = self.vmf.log_density(ss, self.mu_0, self.kappa_0)
-        mu_update, kappa_update = self.root_optimiser(mu_grad, kappa_grad)
+        mu_update = self.root_optimiser(mu_grad)[0]
 
         self.mu_0 += mu_update
-        self.kappa_0 += kappa_update
 
     def write_param(self, path_to_file: str) -> None:
         """
@@ -423,36 +422,57 @@ class VMFIBM1Mult(VMFIBM1):
         self.dirichlet_param = dirichlet_param
         self.dirichlet_total = (source_embeddings.shape[0] - 1) * self.dirichlet_param
 
-    def log_density(self, source_sent: List[int], target_sent: List[int]) -> np.array:
-        cat_score = np.zeros((len(source_sent), len(target_sent)))
+    def compute_categorical_scores(self, source_sent: List[int], target_sent: List[int]) -> np.array:
+        cat_score = np.zeros((len(target_sent), len(source_sent)))
         for tdx, target in enumerate(target_sent):
             pmf = self.translation_categoricals[target]
             for sdx, source in enumerate(source_sent):
-                cat_score[sdx, tdx] = pmf[source]
-        vmf_score = super().log_density(source_sent, target_sent)
-        return cat_score + vmf_score
+                cat_score[tdx, sdx] = pmf[source]
+        return cat_score
 
     def compute_expectations(self, source_sent: List[int], target_sent: List[int]) -> None:
         """
-        Compute the expectations for one sentence pair under the current variational parameters
+        Compute the expectations for one sentence pair under the current variational parameters.
 
-        :param source_sent: The numberised source sentence
-        :param target_sent: The numberised target sentence
+        :param source_sent: The numberised source sentence.
+        :param target_sent: The numberised target sentence.
         """
         source_vecs = self.source_embeddings[source_sent]
-        scores = self.log_density(source_sent, target_sent) if self.init else np.zeros(
-            (len(source_sent), len(target_sent)))
-        # sum rows
-        totals = logsumexp(scores, axis=1, keepdims=True)
-        posteriors = np.exp(scores - totals)
+        target_directions = self.target_directions[target_sent]
+        epsilon = self.noise_samples[target_sent]
+        kappa, target_var_stds, z, soft_plus_grad = self._compute_concentration(target_sent)
+        data_points = len(source_sent)
+        scale = data_points * self.corpus_scale
 
-        self.expected_target_counts[target_sent] += np.sum(posteriors, axis=0)
-        self.expected_target_means[target_sent] += np.dot(posteriors.T, source_vecs)
+        scores, _, kappa_grad = self.vmf.log_density(source_vecs, target_directions, kappa)
+        prior_scores, prior_grad = self.gamma_prior.log_density(kappa)
+        # add log-Jacobian term
+        scores += scale * (prior_scores + np.log(f.sigmoid(z)))
+        scores += self.compute_categorical_scores(source_sent, target_sent)
 
-        for t_idx in range(len(target_sent)):
-            t_counts = self.expected_translation_counts[target_sent[t_idx]]
-            for s_idx in range(len(source_sent)):
-                t_counts[source_sent[s_idx]] += posteriors[s_idx, t_idx]
+        # compute posterior
+        totals = logsumexp(scores, axis=0)[:,np.newaxis]
+        posteriors = np.exp(scores.T - totals).T
+
+        # compute sum of marginal log-likelihoods
+        log_marginal = np.sum(totals)
+
+        # compute expected sufficient statistics
+        observed_vecs = np.dot(posteriors, source_vecs)
+
+        if self.fix_concentration:
+            return log_marginal, observed_vecs, np.zeros((len(target_sent), 1)), np.zeros((len(target_sent), 1))
+
+        # likelihood gradient
+        kappa_grad *= soft_plus_grad
+        # transformed prior gradient
+        prior_grad = scale * (prior_grad * soft_plus_grad + f.sigmoid(-z))
+        # add gradient of log-jacobian
+        var_mean_grad = kappa_grad + prior_grad
+        # multiply with gradients of std normal and embedding transformation and add entropy
+        var_std_grad = var_mean_grad * epsilon * target_var_stds + scale
+
+        return log_marginal, posteriors, observed_vecs, var_mean_grad, var_std_grad
 
     def update_target_params(self) -> None:
         """
