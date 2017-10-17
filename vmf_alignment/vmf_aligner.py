@@ -6,15 +6,14 @@ import random as r
 from collections import Counter
 from typing import Tuple, List, Dict, Optional
 
-import numpy as np
 from gensim.models import Word2Vec, KeyedVectors
 from scipy.misc import logsumexp
 from scipy.special import iv as bessel, psi
 
-from utils import functions as f
-from utils.gamma_distribution import GammaDist
-from utils.vmf_distribution import VMF
-from utils.optimisers import *
+from ..utils import functions as f
+from ..utils.gamma_distribution import GammaDist
+from ..utils.vmf_distribution import VMF
+from ..utils.optimisers import *
 
 
 def read_corpus(path_to_source: str, path_to_target: str, source_embeddings: Word2Vec) -> Tuple[
