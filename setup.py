@@ -14,9 +14,10 @@ kwargs = dict(
     packages= find_packages(),
     install_requires=["gensim>=3", "scipy", "numpy>=1.12"],
     entry_points={
-        "console_scripts" : [
+        "console_scripts": [
             "vmf-aligner = vmf_alignment.vmf_aligner::main"
             "merge-alignments = vmf_utils.merge_alignments:main"
+            "make-vectors = cration.make_vectors::main"
         ]
     }
 )
