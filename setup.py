@@ -1,7 +1,7 @@
 from setuptools import setup, find_packages
 import os
 
-ROOT = os.path(__file__)
+ROOT = os.path.dirname(__file__)
 
 kwargs = dict(
     name="vmf_models",
@@ -12,7 +12,7 @@ kwargs = dict(
     license="Apache Licence 2.0",
     python_requires=">=3.5",
     packages= find_packages(),
-    install_requires=["gensim=>3", "scipy", "numpy"],
+    install_requires=["gensim>=3", "scipy", "numpy>=1.12"],
     entry_points={
         "console_scripts" : [
             "vmf-aligner = vmf_alignment.vmf_aligner::main"
