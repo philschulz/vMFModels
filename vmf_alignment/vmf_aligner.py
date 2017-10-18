@@ -10,10 +10,10 @@ from gensim.models import Word2Vec, KeyedVectors
 from scipy.misc import logsumexp
 from scipy.special import iv as bessel, psi
 
-from ..utils import functions as f
-from ..utils.gamma_distribution import GammaDist
-from ..utils.vmf_distribution import VMF
-from ..utils.optimisers import *
+from vmf_utils import functions as f
+from vmf_utils.gamma_distribution import GammaDist
+from vmf_utils.vmf_distribution import VMF
+from vmf_utils.optimisers import *
 
 
 def read_corpus(path_to_source: str, path_to_target: str, source_embeddings: Word2Vec) -> Tuple[

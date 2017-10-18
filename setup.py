@@ -16,6 +16,7 @@ kwargs = dict(
     entry_points={
         "console_scripts" : [
             "vmf-aligner = vmf_alignment.vmf_aligner::main"
+            "merge-alignments = vmf_utils.merge_alignments:main"
         ]
     }
 )
