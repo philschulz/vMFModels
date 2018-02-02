@@ -1,19 +1,22 @@
-import argparse, sys, os
+import argparse
 # warnings.filterwarnings("error")
 # necessary for processing on cluster
 import logging
+import os
 import random as r
+import sys
 from collections import Counter
-from typing import Tuple, List, Dict, Optional
+from typing import Tuple, Dict
 
+import mxnet as mx
 from gensim.models import Word2Vec, KeyedVectors
 from scipy.misc import logsumexp
-from scipy.special import iv as bessel, psi
+from scipy.special import psi
 
 from vmf_utils import functions as f
 from vmf_utils.gamma_distribution import GammaDist
-from vmf_utils.vmf_distribution import VMF
 from vmf_utils.optimisers import *
+from vmf_utils.vmf_distribution import *
 
 
 def read_corpus(path_to_source: str, path_to_target: str, source_embeddings: Word2Vec) -> Tuple[
@@ -166,7 +169,7 @@ class VMFIBM1(object):
 
         # vMF concentration parameters and noise
         self.target_norm_means = np.random.uniform(low=0, high=1, size=(len(self.target_vocab), 1))
-        self.target_norm_std_embed = np.random.uniform(low=0,high=1,size=(len(self.target_vocab), 1))
+        self.target_norm_std_embed = np.random.uniform(low=0, high=1, size=(len(self.target_vocab), 1))
         self.noise_samples = None
         self.target_concentration = np.ones(
             self.target_norm_std_embed.shape) * concentration_fix if concentration_fix else None
@@ -450,7 +453,7 @@ class VMFIBM1Mult(VMFIBM1):
         scores += self.compute_categorical_scores(source_sent, target_sent)
 
         # compute posterior
-        totals = logsumexp(scores, axis=0)[:,np.newaxis]
+        totals = logsumexp(scores, axis=0)[:, np.newaxis]
         posteriors = np.exp(scores.T - totals).T
 
         # compute sum of marginal log-likelihoods
@@ -582,9 +585,53 @@ def main():
     embeddings = KeyedVectors.load_word2vec_format(args.embeddings, binary=args.binary)
 
     logger.info("Constructing corpus")
-    corpus, source_map, target_map, source_mean_direction, source_tokens = \
+    corpus, source_map, target_map, source_mean_direction, source_vocab_size = \
         read_corpus(args.source, args.target, embeddings)
     dim = embeddings.vector_size
+    target_vocab_size = len(target_map)
+
+    source_corpus = mx.nd.array(corpus[0])
+    target_corpus = mx.nd.array(corpus[1])
+
+    data_iter = mx.io.NDArrayIter(data={"target": target_corpus}, label={"source": source_corpus},
+                                  batch_size=batch_size,
+                                  shuffle=True, label_name="source", data_name="target")
+
+    source = mx.sym.Variable("source")
+    target = mx.sym.Variable("target")
+    mu_0 = mx.sym.Variable("mu0_weight", shape=(batch_size,))
+    kappa_0 = mx.sym.Variable("kappa0_weight", shape=(batch_size, 1))
+
+    target_embed_weight = mx.sym.Variable("target_embed_weight")
+    kappa_std_embed_weight = mx.sym.Variable("kappa_std_embed_weight")
+    kappa_mean_weight = mx.sym.Variable("kappa_mean_weight")
+
+    source_embed = mx.sym.Embedding(data=source, input_dim=source_vocab_size, output_dim=dim)
+    target_embed = mx.sym.Embedding(data=target, input_dim=target_vocab_size, output_dim=dim,
+                                    weight=target_embed_weight)
+    kappa_std_embed = mx.sym.Embedding(data=target, input_dim=target_vocab_size, output_dim=1,
+                                       weight=kappa_std_embed_weight)
+    kappa_mean = mx.sym.Embedding(data=target_embed, input_dim=target_vocab_size, output_dim=1,
+                                  weight=kappa_mean_weight)
+
+    kappa_std = mx.sym.exp(data=kappa_std_embed)
+    z = kappa_mean + kappa_std * mx.sym.random_normal(loc=0, scale=1, shape=(0, 1))
+    kappa = mx.sym.Activation(data=z, act_type="softplus")
+    kappa_expanded = mx.sym.expand_dims(data=kappa, axis=1)
+
+    energy = mx.sym.batch_dot(lhs=source_embed, rhs=target_embed, transpose_b=True)
+    normaliser = vmf_normaliser(dim=dim, kappa=kappa)
+    likelihood = mx.sym.broadcast_add(lhs=normaliser, rhs=mx.sym.broadcast_mul(lhs=energy, rhs=kappa_expanded))
+
+    vmf_prior = mx.sym.broadcast_add(lhs=vmf_normaliser(dim=dim, kappa=kappa_0),
+                                     rhs=mx.sym.broadcast_add(lhs=kappa_0, rhs=mu_0) * target_embed)
+
+    gamma_prior = mx.sym.Custom(shape=1, rate=1, label=kappa, op_type="gammaDist")
+    model = likelihood + vmf_prior + gamma_prior + mx.sym.log(
+        mx.sym.Activation(data=kappa, act_type="sigmoid", name="model_jacobian"))
+    loss = mx.sym.MakeLoss(data=model)
+
+    mod = mx.mod.Module(loss)
 
     aligner = VMFIBM1(dim, source_map, source_tokens, target_map, optimiser, True, fix, logger=logger) \
         if model == "vmf" else VMFIBM1Mult(dim, source_map, target_map, dir)
