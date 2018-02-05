@@ -3,21 +3,60 @@ import numpy as np
 from scipy.special import iv as bessel
 
 
+class Bessel(mx.operator.CustomOp):
+
+    def forward(self, is_train, req, in_data, out_data, aux):
+        order = in_data[0]
+        data = in_data[1].asnumpy()
+
+        result = mx.nd.array(bessel(order, data))
+
+        self.assign(out_data[0], req[0], result)
+
+
+    def backward(self, req, out_grad, in_data, out_data, in_grad, aux):
+        order = in_data[0]
+        data = in_data[1].asnumpy()
+
+        bessel_grad = mx.nd.array(bessel(order - 2, data) - bessel(order + 1, data) / 2)
+        grad = out_grad[0] * bessel_grad
+
+        self.assign(in_grad[0], req[0], grad)
+
+
+@mx.operator.register("bessel")
+class BesselOpProp(mx.operator.CustomOpProp):
+
+    def list_arguments(self):
+        return ["dim", 'data']
+
+    def list_outputs(self):
+        return ["output"]
+
+    def infer_shape(self, in_shape):
+        out_shape = in_shape[0]
+
+        return [in_shape], [out_shape], []
+
+    def create_operator(self, ctx, in_shapes, in_dtypes):
+        return Bessel()
+
+
 class LogBessel(mx.operator.CustomOp):
 
     def forward(self, is_train, req, in_data, out_data, aux):
         order = in_data[0]
-        data = in_data[1]
+        data = in_data[1].asnumpy()
 
-        result = np.log(bessel(order, data))
+        result = mx.nd.array(np.log(bessel(order, data)))
 
-        self.assign(out_data[0], req[0], mx.nd.array(result))
+        self.assign(out_data[0], req[0], result)
 
     def backward(self, req, out_grad, in_data, out_data, in_grad, aux):
         order = in_data[0]
         data = in_data[1]
 
-        log_bessel_grad = mx.nd.array(bessel(order - 2, data) - bessel(order + 1, data)) / 2 * bessel(order, data)
+        log_bessel_grad = mx.nd.array(bessel(order - 2, data) - bessel(order + 1, data) / 2 * bessel(order, data))
         grad = out_grad * log_bessel_grad
 
         self.assign(in_grad[0], req[0], grad)
@@ -38,7 +77,7 @@ class LogBesselOpProp(mx.operator.CustomOpProp):
         return [out_shape], [out_shape], []
 
     def create_operator(self, ctx, in_shapes, in_dtypes):
-        return LogBessel
+        return LogBessel()
 
 
 def vmf_normaliser(dim, kappa):
@@ -51,7 +90,7 @@ def vmf_normaliser(dim, kappa):
 class VMFDistribution(mx.operator.CustomOp):
 
     def log_bessel_gradient(self, dim: int, kappa: mx.nd.array) -> mx.nd.array:
-        return (bessel(dim / 2 - 2, kappa) - bessel(dim / 2, kappa)) / bessel(dim / 2 - 1, kappa)
+        return (bessel(dim / 2 - 2, kappa) - bessel(dim / 2, kappa)) / 2 * bessel(dim / 2 - 1, kappa)
 
     def forward(self, is_train, req, in_data, out_data, aux):
         mu = in_data[0]
