@@ -7,6 +7,30 @@ sigmoid = expit
 soft_plus_derivative = expit
 
 
+def exp_op(data: np.array) -> Tuple[np.array, np.array]:
+    exp = np.exp(data)
+    return exp, exp
+
+
+def gauss_transform_op(mu, sigma, epsilon) -> Tuple[np.array, np.array, np.array]:
+    gauss_var = mu + sigma * epsilon
+    return gauss_var, np.ones_like(mu), epsilon
+
+
+def sofplus_op(data: np.array) -> Tuple[np.array]:
+    softplus = np.log(1 + np.exp(data))
+    grad = sigmoid(data)
+
+    return softplus, grad
+
+
+def sigmoid_op(data: np.array) -> Tuple[np.array]:
+    result = sigmoid(data)
+    grad = result * (1 - result)
+
+    return result, grad
+
+
 def soft_plus(x: np.array) -> Tuple[np.array, np.array]:
     result = np.log(np.exp(x) + 1)
     gradient = soft_plus_derivative(x)
@@ -45,9 +69,3 @@ def diagonal_gaussian_kl_grad(mean: np.array, std: np.array) -> Tuple[float, flo
     mean_grad = -np.sum(mean, axis=1)
     std_grad = np.sum(std/(std**2) - std, axis=1)
     return mean_grad, std_grad
-
-
-def std_gaussian_sample_transform(self, mu: np.array, sigma: np.array):
-    epsilon = np.random.norm(sigma.size)
-    x = mu + sigma * epsilon
-    return x, 1, epsilon

@@ -233,6 +233,17 @@ class VMFIBM1(object):
 
         return self.target_directions * bessel(self.dim/2-1, self.kappa) / bessel(self.dim/2, self.kappa)
 
+
+    def compute(self):
+
+        norm = np.linalg.norm(x=self.vMF_natural_params, axis=self.vMF_natural_params.ndim-1, ord=2, keepdims=True)
+        means  = self.vMF_natural_params / norm
+        directions = self.bessel_ratio(norm) * means
+
+
+
+
+
     def train(self, corpus: List[Tuple[List[int], List[int]]], iterations: int, batch_size: int) -> None:
         iterator = BatchIterator(corpus, batch_size)
 
