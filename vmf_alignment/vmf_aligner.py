@@ -176,8 +176,8 @@ def main():
 
     source = mx.sym.Variable("source")
     target = mx.sym.Variable("target")
-    mu_0 = mx.sym.Variable("mu0_weight", shape=(batch_size,dim))
-    kappa_0 = mx.sym.Variable("kappa0_weight", shape=(batch_size, 1))
+    mu_0 = mx.sym.tile(data=mx.sym.Variable("mu0_weight", shape=(1,dim)), reps=(batch_size, 1))
+    kappa_0 = mx.sym.tile(data=mx.sym.Variable("kappa0_weight", shape=(1, 1)), reps=(batch_size, 1))
 
     target_embed_weight = mx.sym.Variable("target_embed_weight")
     kappa_std_embed_weight = mx.sym.Variable("kappa_std_embed_weight")
@@ -205,6 +205,7 @@ def main():
     likelihood = mx.sym.broadcast_add(lhs=normaliser, rhs=mx.sym.broadcast_mul(lhs=energy, rhs=kappa_expanded))
     max = mx.sym.max(likelihood, axis=2)
     total_logLikelihood = max + mx.sym.log(mx.sym.sum(data=mx.sym.exp(likelihood - max), axis=2, keepdims=False))
+    total_logLikelihood = mx.sym.reshape(data=total_logLikelihood, shape=(-1,))
 
 
     prior_ss = mx.sym.expand_dims(mx.sym.broadcast_mul(lhs=kappa_0, rhs=mu_0), axis=1)
