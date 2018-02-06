@@ -164,9 +164,11 @@ class VMFIBM1(object):
         self.vMF_natural_params = np.random.normal(size=(len(self.target_vocab), dim))
         self.target_directions = self.normalise(self.vMF_natural_params)
 
+        self.fix_concentration = concentration_fix is not None
         # vMF concentration parameters and noise
-        self.target_norm_means = np.random.uniform(low=0, high=1, size=(len(self.target_vocab), 1))
+        self.target_norm_means = np.ones(shape=(len(self.target_vocab), 1)) if self.fix_concentration else np.random.uniform(low=0, high=1, size=(len(self.target_vocab), 1))
         self.target_norm_std_embed = np.random.uniform(low=0,high=1,size=(len(self.target_vocab), 1))
+        self.kappa = np.zeros_like(self.target_norm_means)
         self.noise_samples = None
         self.target_concentration = np.ones(
             self.target_norm_std_embed.shape) * concentration_fix if concentration_fix else None
@@ -176,7 +178,6 @@ class VMFIBM1(object):
         self.mu_0 = self.normalise(
             np.random.normal(size=(1, self.source_embeddings.shape[1])))  # np.mean(self.source_embeddings, axis=0)
         self.kappa_0 = np.array([dim], dtype=np.float64)
-        self.fix_concentration = concentration_fix is not None
 
         # initialise optimiser
         self.child_optimiser = optimiser(
@@ -228,6 +229,10 @@ class VMFIBM1(object):
         kappa, soft_plus_grad = f.soft_plus(z)
         return kappa
 
+    def compute_target_directions(self):
+
+        return self.target_directions * bessel(self.dim/2-1, self.kappa) / bessel(self.dim/2, self.kappa)
+
     def train(self, corpus: List[Tuple[List[int], List[int]]], iterations: int, batch_size: int) -> None:
         iterator = BatchIterator(corpus, batch_size)
 
@@ -246,27 +251,37 @@ class VMFIBM1(object):
                 self.logger.debug('Variational std embedding for kappa = {}'.format(mean_std))
 
                 self.noise_samples = np.random.normal(loc=0, scale=1, size=self.target_norm_std_embed.shape)
+                self.kappa, target_var_stds, z, softplus_grad = self._compute_concentration()
+
+                gamma_density, gamma_grad = self.gamma_prior.log_density(self.kappa)
+                if not self.fix_concentration:
+                    gamma_density += softplus_grad
+
+                vmf_density, *_ = self.vmf.log_density(data=self.target_directions, mu=self.mu_0, kappa=self.kappa_0)
+                prior_density = gamma_density + vmf_density
+
                 log_likelihood = 0
                 data_points = 0
                 target_ss = np.zeros((len(self.target_vocab), self.dim))
-                mean_grad = np.zeros((len(self.target_vocab), 1))
-                std_grad = np.zeros((len(self.target_vocab), 1))
+                kappa_grad_store = np.zeros((len(self.target_vocab), 1))
+                observed_targets = set()
 
                 for source_sent, target_sent in batch:
+                    observed_targets.union(set(target_sent))
                     data_points += len(source_sent)
-                    log_marginal, expected_ss, var_mean_grad, var_std_grad = self.compute_expectations(
+                    log_marginal, expected_ss, kappa_grad = self.compute_expectations(
                         source_sent, target_sent)
                     log_likelihood += log_marginal
                     target_ss[target_sent] += expected_ss
-                    mean_grad[target_sent] += var_mean_grad
-                    std_grad[target_sent] += var_std_grad
+                    kappa_grad_store[target_sent] += kappa_grad
+
+                mean_grad = softplus_grad * (kappa_grad_store + gamma_density) + (1 - softplus_grad) if not self.fix_concentration else kappa_grad
+                std_grad = mean_grad * self.noise_samples * target_var_stds + 1 if not self.fix_concentration else kappa_grad
 
                 # integrate density from top-level distribution
                 log_likelihood *= self.source_tokens / data_points
-                prior_density, *_ = self.vmf.log_density(np.sum(self.target_directions, axis=0, keepdims=True),
-                                                         self.mu_0, self.kappa_0)
-                prior_density = np.sum(prior_density)
-                log_likelihood += prior_density
+                log_likelihood += np.sum(prior_density[list(observed_targets)])
+                self.logger.info("prior at batch {}: {}".format(batch_num, np.sum(prior_density[list(observed_targets)])))
                 self.logger.info("Log-likelihood at batch {}: {}".format(batch_num, log_likelihood))
 
                 target_ss *= self.source_tokens / data_points
@@ -290,6 +305,8 @@ class VMFIBM1(object):
         if self.fix_concentration:
             kappa = self.target_concentration[target_sentence] if target_sentence else self.target_concentration
             soft_plus_grad = None
+            target_var_stds = None
+            z = None
         else:
             target_var_means = self.target_norm_means[
                 target_sentence] if target_sentence else self.target_norm_std_embed
@@ -310,15 +327,9 @@ class VMFIBM1(object):
         """
         source_vecs = self.source_embeddings[source_sent]
         target_directions = self.target_directions[target_sent]
-        epsilon = self.noise_samples[target_sent]
-        kappa, target_var_stds, z, soft_plus_grad = self._compute_concentration(target_sent)
-        data_points = len(source_sent)
-        scale = data_points * self.corpus_scale
+        kappa = self.kappa[target_sent]
 
         scores, _, kappa_grad = self.vmf.log_density(source_vecs, target_directions, kappa)
-        prior_scores, prior_grad = self.gamma_prior.log_density(kappa)
-        # add log-Jacobian term
-        scores += scale * (prior_scores + np.log(f.sigmoid(z)))
 
         # compute posterior
         totals = logsumexp(scores, axis=0).reshape(len(source_sent), 1)
@@ -331,18 +342,9 @@ class VMFIBM1(object):
         observed_vecs = np.dot(posteriors, source_vecs)
 
         if self.fix_concentration:
-            return log_marginal, observed_vecs, np.zeros((len(target_sent), 1)), np.zeros((len(target_sent), 1))
+            return log_marginal, observed_vecs, np.zeros((len(target_sent), 1))
 
-        # likelihood gradient
-        kappa_grad *= soft_plus_grad
-        # transformed prior gradient
-        prior_grad = scale * (prior_grad * soft_plus_grad + f.sigmoid(-z))
-        # add gradient of log-jacobian
-        var_mean_grad = kappa_grad + prior_grad
-        # multiply with gradients of std normal and embedding transformation and add entropy
-        var_std_grad = var_mean_grad * epsilon * target_var_stds + scale
-
-        return log_marginal, observed_vecs, var_mean_grad, var_std_grad
+        return log_marginal, observed_vecs, kappa_grad
 
     def update_params(self, direction_ss: np.array, variational_mean_gradient: np.array,
                       variational_std_gradient: np.array) -> None:
@@ -376,8 +378,9 @@ class VMFIBM1(object):
             self.target_norm_std_embed += var_std_embed_update
 
         # compute expected mean directions
-        target_means = self.normalise(self.vMF_natural_params)
-        self.target_directions = target_means * self.bessel_ratio(target_concentrations)
+        norm = np.linalg.norm(self.vMF_natural_params, axis=self.vMF_natural_params.ndim - 1, keepdims=True)
+        target_means = self.vMF_natural_params / norm
+        self.target_directions = target_means * self.bessel_ratio(norm)
 
     def update_global_params(self) -> None:
         """Update the global parameters through empirical Bayes (MLE on expected params)"""
@@ -397,7 +400,7 @@ class VMFIBM1(object):
         with open(path_to_file + ".means", "w") as means, open(path_to_file + ".concentration", "w") as conc:
             means.write(str(self.target_directions.shape[0]) + " " + str(self.dim) + "\n")
             # no embedding needed for NULL word
-            kappas, _ = f.soft_plus(self.target_norm_means + np.exp(self.target_norm_std_embed))
+            kappas, _ = f.soft_plus(self.target_norm_means)
             kappas = kappas.reshape((kappas.size,))
 
             for word, idx in self.target_vocab.items():

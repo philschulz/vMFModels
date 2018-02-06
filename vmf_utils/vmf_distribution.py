@@ -29,4 +29,4 @@ class VMF(object):
         return density, mu_grad, kappa_grad
 
     def __log_bessel_gradient(self, kappa: float) -> float:
-        return (bessel(self.dim / 2 - 2, kappa) - bessel(self.dim / 2, kappa)) / self.bessel(kappa)
+        return (bessel(self.dim / 2 - 2, kappa) - bessel(self.dim / 2, kappa)) / 2 * self.bessel(kappa)
