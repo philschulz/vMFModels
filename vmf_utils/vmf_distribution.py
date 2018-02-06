@@ -18,7 +18,7 @@ class Bessel(mx.operator.CustomOp):
         order = in_data[0]
         data = in_data[1].asnumpy()
 
-        bessel_grad = mx.nd.array(bessel(order - 2, data) - bessel(order + 1, data) / 2)
+        bessel_grad = mx.nd.array((bessel(order - 2, data) - bessel(order + 1, data)) / 2)
         grad = out_grad[0] * bessel_grad
 
         self.assign(in_grad[0], req[0], grad)
@@ -56,7 +56,7 @@ class LogBessel(mx.operator.CustomOp):
         order = in_data[0]
         data = in_data[1]
 
-        log_bessel_grad = mx.nd.array(bessel(order - 2, data) - bessel(order + 1, data) / 2 * bessel(order, data))
+        log_bessel_grad = mx.nd.array((bessel(order - 2, data) - bessel(order + 1, data)) / 2 * bessel(order, data))
         grad = out_grad * log_bessel_grad
 
         self.assign(in_grad[0], req[0], grad)

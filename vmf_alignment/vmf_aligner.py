@@ -75,6 +75,14 @@ def read_corpus(path_to_source: str, path_to_target: str, source_embeddings: Wor
     return corpus, source2vec, target_map, (source_mean_direction / (source2vec.shape[0] - 1)), source_tokens
 
 
+def norm(data, axis, order=2, keepdims=True):
+    exp = mx.sym.pow(base=data, exp=order)
+    sum = mx.sym.sum(data=exp, axis=axis, keepdims=keepdims)
+    norm = mx.sym.pow(base=sum, exp=1/order)
+
+    return norm
+
+
 def main():
     command_line_parser = argparse.ArgumentParser("This is word alignment tool that uses word vectors on the source"
                                                   "side.")
@@ -168,7 +176,7 @@ def main():
 
     source = mx.sym.Variable("source")
     target = mx.sym.Variable("target")
-    mu_0 = mx.sym.Variable("mu0_weight", shape=(batch_size,))
+    mu_0 = mx.sym.Variable("mu0_weight", shape=(batch_size,dim))
     kappa_0 = mx.sym.Variable("kappa0_weight", shape=(batch_size, 1))
 
     target_embed_weight = mx.sym.Variable("target_embed_weight")
@@ -188,19 +196,23 @@ def main():
     kappa = mx.sym.Activation(data=z, act_type="softplus")
     kappa_expanded = mx.sym.expand_dims(data=kappa, axis=1)
 
-    target_direction = mx.sym.L2Normalization(data=target_embed, mode="spatial")
-    target_direction = mx.sym.broadcast_mul(lhs=mx.sym.Custom(dim=dim/2, data=kappa_expanded, op_type="bessel") / mx.sym.Custom(dim=dim/2-1, data=kappa_expanded), rhs=target_direction)
+    target_embed_norm = norm(data=target_embed, axis=2, keepdims=True)
+    target_direction = target_embed / target_embed_norm
+    target_direction = mx.sym.broadcast_mul(lhs=mx.sym.Custom(dim=dim/2, data=target_embed_norm, op_type="bessel") / mx.sym.Custom(dim=dim/2-1, data=target_embed_norm), rhs=target_direction)
 
     energy = mx.sym.batch_dot(lhs=source_embed, rhs=target_direction, transpose_b=True)
     normaliser = vmf_normaliser(dim=dim/2-1, kappa=kappa)
     likelihood = mx.sym.broadcast_add(lhs=normaliser, rhs=mx.sym.broadcast_mul(lhs=energy, rhs=kappa_expanded))
-    # TODO: marginalise
+    max = mx.sym.max(likelihood, axis=2)
+    total_logLikelihood = max + mx.sym.log(mx.sym.sum(data=mx.sym.exp(likelihood - max), axis=2, keepdims=False))
 
+
+    prior_ss = mx.sym.expand_dims(mx.sym.broadcast_mul(lhs=kappa_0, rhs=mu_0), axis=1)
     vmf_prior = mx.sym.broadcast_add(lhs=vmf_normaliser(dim=dim, kappa=kappa_0),
-                                     rhs=mx.sym.broadcast_add(lhs=kappa_0, rhs=mu_0) * target_direction)
+                                     rhs=mx.sym.sum(mx.sym.broadcast_mul(lhs=prior_ss, rhs=target_direction), axis=2, keepdims=False))
 
     gamma_prior = mx.sym.Custom(shape=1, rate=1, label=kappa, op_type="gammaDist")
-    model = likelihood + vmf_prior + gamma_prior  + mx.sym.log(
+    model = likelihood + mx.sym.broadcast_add(lhs=vmf_prior, rhs=gamma_prior) + mx.sym.log(
         mx.sym.Activation(data=kappa, act_type="sigmoid", name="model_jacobian"))
     loss = mx.sym.MakeLoss(data=model)
 
