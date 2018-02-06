@@ -7,9 +7,27 @@ sigmoid = expit
 soft_plus_derivative = expit
 
 
+def diagonal_gaussian_entropy(sigma: np.array):
+    N = sigma.shape[-1]
+    return (N/2) * (np.log(2*np.pi) + 1) + np.sum(sigma, axis=sigma.ndim-1, keepdims=False)
+
+
 def exp_op(data: np.array) -> Tuple[np.array, np.array]:
     exp = np.exp(data)
     return exp, exp
+
+
+def log_op(x: np.array) -> Tuple[np.array, np.array]:
+    result = np.log(x)
+    grad = 1/x
+
+    return result, grad
+
+def bessel_op(x: np.array, order: int) -> Tuple[np.array, np.array]:
+    result = bessel(order, x)
+    grad = (bessel(order - 1, x) - bessel(order + 1, x)) / 2
+
+    return result, grad
 
 
 def gauss_transform_op(mu, sigma, epsilon) -> Tuple[np.array, np.array, np.array]:

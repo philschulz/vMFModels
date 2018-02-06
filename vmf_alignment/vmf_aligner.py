@@ -166,7 +166,8 @@ class VMFIBM1(object):
 
         self.fix_concentration = concentration_fix is not None
         # vMF concentration parameters and noise
-        self.target_norm_means = np.ones(shape=(len(self.target_vocab), 1)) if self.fix_concentration else np.random.uniform(low=0, high=1, size=(len(self.target_vocab), 1))
+        self.target_norm_means = np.ones(shape=(len(self.target_vocab), 1)) if self.fix_concentration else np.random.normal(loc=0, scale=5, size=(len(self.target_vocab), 1)) + self.dim
+        self.init_means = np.array(self.target_norm_means)
         self.target_norm_std_embed = np.random.uniform(low=0,high=1,size=(len(self.target_vocab), 1))
         self.kappa = np.zeros_like(self.target_norm_means)
         self.noise_samples = None
@@ -229,21 +230,6 @@ class VMFIBM1(object):
         kappa, soft_plus_grad = f.soft_plus(z)
         return kappa
 
-    def compute_target_directions(self):
-
-        return self.target_directions * bessel(self.dim/2-1, self.kappa) / bessel(self.dim/2, self.kappa)
-
-
-    def compute(self):
-
-        norm = np.linalg.norm(x=self.vMF_natural_params, axis=self.vMF_natural_params.ndim-1, ord=2, keepdims=True)
-        means  = self.vMF_natural_params / norm
-        directions = self.bessel_ratio(norm) * means
-
-
-
-
-
     def train(self, corpus: List[Tuple[List[int], List[int]]], iterations: int, batch_size: int) -> None:
         iterator = BatchIterator(corpus, batch_size)
 
@@ -261,73 +247,76 @@ class VMFIBM1(object):
                 self.logger.debug('Variational mean for kappa = {}'.format(mean_mean))
                 self.logger.debug('Variational std embedding for kappa = {}'.format(mean_std))
 
+                # compute kappa, z and the log-jacobian term
                 self.noise_samples = np.random.normal(loc=0, scale=1, size=self.target_norm_std_embed.shape)
-                self.kappa, target_var_stds, z, softplus_grad = self._compute_concentration()
+                z, mean_grad, std_grad = self.compute_z()
+                log_jacobian, log_jacobian_grad = self.compute_log_jacobian(z)
+                self.kappa, kappa_grad = self.compute_kappa(z)
 
-                gamma_density, gamma_grad = self.gamma_prior.log_density(self.kappa)
-                if not self.fix_concentration:
-                    gamma_density += softplus_grad
+                # priors
+                gamma_log_density, gamma_grad = self.gamma_prior.log_density(self.kappa)
+                gamma_log_density += log_jacobian
+                vmf_log_prior, *_ = self.vmf.log_density(data=self.target_directions, mu=self.mu_0, kappa=self.kappa_0)
+                vmf_log_prior = np.reshape(vmf_log_prior, newshape=gamma_log_density.shape)
+                prior_log_density = gamma_log_density + vmf_log_prior
 
-                vmf_density, *_ = self.vmf.log_density(data=self.target_directions, mu=self.mu_0, kappa=self.kappa_0)
-                prior_density = gamma_density + vmf_density
-
+                # likelihood
                 log_likelihood = 0
                 data_points = 0
                 target_ss = np.zeros((len(self.target_vocab), self.dim))
-                kappa_grad_store = np.zeros((len(self.target_vocab), 1))
+                concentration_grad_store = np.zeros((len(self.target_vocab), 1))
                 observed_targets = set()
 
                 for source_sent, target_sent in batch:
-                    observed_targets.union(set(target_sent))
+                    observed_targets.update(set(target_sent))
                     data_points += len(source_sent)
-                    log_marginal, expected_ss, kappa_grad = self.compute_expectations(
+                    log_marginal, expected_ss, concentration_grad = self.compute_expectations(
                         source_sent, target_sent)
                     log_likelihood += log_marginal
                     target_ss[target_sent] += expected_ss
-                    kappa_grad_store[target_sent] += kappa_grad
+                    concentration_grad_store[target_sent] += concentration_grad
 
-                mean_grad = softplus_grad * (kappa_grad_store + gamma_density) + (1 - softplus_grad) if not self.fix_concentration else kappa_grad
-                std_grad = mean_grad * self.noise_samples * target_var_stds + 1 if not self.fix_concentration else kappa_grad
+                # density
+                observed = list(observed_targets)
+                log_likelihood *= self.source_tokens / data_points
+                prior_log_density = np.sum(prior_log_density[observed])
+                log_likelihood += prior_log_density
+                gauss_entropy = np.sum(f.diagonal_gaussian_entropy(np.exp(self.target_norm_std_embed[observed])))
+                print(gauss_entropy)
+                log_likelihood += gauss_entropy
+
+                # gradients
+                concentration_grad_store *= self.source_tokens / data_points
+                mean_grad = (concentration_grad_store + gamma_grad) * kappa_grad + log_jacobian_grad
+                std_grad = mean_grad * std_grad + 1 if not self.fix_concentration else kappa_grad
+                print("gradient shapes. concentration = {}, mean ={}, std = {}, ss = {}".format(concentration_grad.shape, mean_grad.shape, std_grad.shape, expected_ss.shape))
 
                 # integrate density from top-level distribution
-                log_likelihood *= self.source_tokens / data_points
-                log_likelihood += np.sum(prior_density[list(observed_targets)])
-                self.logger.info("prior at batch {}: {}".format(batch_num, np.sum(prior_density[list(observed_targets)])))
+                self.logger.info("prior at batch {}: {}".format(batch_num, np.sum(prior_log_density)))
                 self.logger.info("Log-likelihood at batch {}: {}".format(batch_num, log_likelihood))
 
                 target_ss *= self.source_tokens / data_points
-                mean_grad *= self.source_tokens / data_points
-                std_grad *= self.source_tokens / data_points
-
                 self.logger.info('Updating variational parameters')
                 self.update_params(target_ss, mean_grad, std_grad)
                 batch, batch_num = iterator.next()
 
             iterator.reset()
 
-    def _compute_concentration(self, target_sentence: Optional[List[int]] = None) -> Tuple[np.array, np.array]:
-        """
-        Compute the concentration parameters for a target sentence or the entire corpus if not target sentence is
-        provided.
+    def compute_z(self):
+        std, embed_grad = f.exp_op(self.target_norm_std_embed)
+        z, mean_grad, std_grad = f.gauss_transform_op(self.target_norm_means, std, self.noise_samples)
+        return z, mean_grad, std_grad * embed_grad
 
-        :param target_sentence: The target sentence.
-        :return: The concentration parameters and softplus gradients.
-        """
-        if self.fix_concentration:
-            kappa = self.target_concentration[target_sentence] if target_sentence else self.target_concentration
-            soft_plus_grad = None
-            target_var_stds = None
-            z = None
-        else:
-            target_var_means = self.target_norm_means[
-                target_sentence] if target_sentence else self.target_norm_std_embed
-            target_var_stds = np.exp(
-                self.target_norm_std_embed[target_sentence] if target_sentence else self.target_norm_std_embed)
-            epsilon = self.noise_samples[target_sentence] if target_sentence else self.noise_samples
-            z = target_var_means + target_var_stds * epsilon
-            kappa, soft_plus_grad = f.soft_plus(z)
+    def compute_log_jacobian(self, z):
+        jacobian, j_grad = f.sofplus_op(z)
+        log_jacobian, log_grad = f.log_op(jacobian)
 
-        return kappa, target_var_stds, z, soft_plus_grad
+        return np.log(jacobian), j_grad*log_grad
+
+    def compute_kappa(self, z):
+        kappa, grad = f.sofplus_op(z)
+
+        return kappa, grad
 
     def compute_expectations(self, source_sent: List[int], target_sent: List[int]) -> None:
         """
@@ -340,7 +329,8 @@ class VMFIBM1(object):
         target_directions = self.target_directions[target_sent]
         kappa = self.kappa[target_sent]
 
-        scores, _, kappa_grad = self.vmf.log_density(source_vecs, target_directions, kappa)
+        scores, mu_grad, kappa_grad = self.vmf.log_density(source_vecs, target_directions, kappa)
+        kappa_grad = np.sum(kappa_grad, axis=1, keepdims=True)
 
         # compute posterior
         totals = logsumexp(scores, axis=0).reshape(len(source_sent), 1)
@@ -376,8 +366,7 @@ class VMFIBM1(object):
         the target types.
         """
         prior_ss = self.kappa_0 * self.mu_0
-        target_concentrations, *_ = self._compute_concentration()
-        natural_params = target_concentrations * direction_ss + prior_ss
+        natural_params = direction_ss + prior_ss
         natural_gradient = natural_params - self.vMF_natural_params
 
         natural_param_upate, var_mean_update, var_std_embed_update = \
